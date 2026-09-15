@@ -13,8 +13,10 @@ import {
 } from '../types/workbuddy';
 import { useProviderAccountsPage } from '../hooks/useProviderAccountsPage';
 import { WorkbuddyCheckinModal } from '../components/codebuddy-suite/CodebuddySuiteCheckinModal';
+import { WorkbuddyActivityCenterModal } from '../components/codebuddy-suite/WorkbuddyActivityCenterModal';
 import { CodebuddySessionManager } from '../components/codebuddy/CodebuddySessionManager';
 import { CodebuddySuiteAccountsSharedView, type CodebuddySuiteAccountsPlatformConfig } from '../components/codebuddy-suite/CodebuddySuiteAccountsSharedView';
+import { WorkbuddyActivityLogsPanel } from '../components/codebuddy-suite/WorkbuddyActivityLogsPanel';
 import { compareCurrentAccountFirst } from '../utils/currentAccountSort';
 
 const WORKBUDDY_FLOW_NOTICE_COLLAPSED_KEY = 'agtools.workbuddy.flow_notice_collapsed';
@@ -73,6 +75,7 @@ const workbuddyPlatformConfig: CodebuddySuiteAccountsPlatformConfig<WorkbuddyAcc
   quotaPrefix: 'workbuddy',
   tableUsageClassName: 'workbuddy-table-usage',
   CheckinModal: WorkbuddyCheckinModal,
+  ActivityCenterModal: WorkbuddyActivityCenterModal,
 };
 
 export function WorkbuddyAccountsPage() {
@@ -134,12 +137,16 @@ export function WorkbuddyAccountsPage() {
         platform="workbuddy"
         active={activeTab}
         onTabChange={setActiveTab}
-        tabs={['overview', 'sessions', 'instances']}
+        tabs={['overview', 'sessions', 'instances', 'activityLogs']}
       />
       {activeTab === 'sessions' ? (
         <CodebuddySessionManager platform="workbuddy" accounts={store.accounts as any} />
       ) : activeTab === 'instances' ? (
         <WorkbuddyInstancesContent accountsForSelect={accountsForInstances} />
+      ) : activeTab === 'activityLogs' ? (
+        <div style={{ padding: '12px 16px 24px', overflowY: 'auto', flex: 1, minHeight: 0 }}>
+          <WorkbuddyActivityLogsPanel />
+        </div>
       ) : (
         <CodebuddySuiteAccountsSharedView
           accounts={store.accounts}

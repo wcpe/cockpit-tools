@@ -1,6 +1,6 @@
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Clock3, FolderOpen, Github, Globe2, Layers, MoreHorizontal, PanelTop, Server } from 'lucide-react';
+import { Clock3, FileText, FolderOpen, Github, Globe2, Layers, MoreHorizontal, PanelTop, Server } from 'lucide-react';
 import { CodexIcon } from '../icons/CodexIcon';
 import { ClaudeIcon } from '../icons/ClaudeIcon';
 import { WindsurfIcon } from '../icons/WindsurfIcon';
@@ -31,7 +31,8 @@ export type PlatformOverviewTab =
   | 'sessions'
   | 'providers'
   | 'proxy'
-  | 'top-layout';
+  | 'top-layout'
+  | 'activityLogs';
 export type PlatformOverviewHeaderId =
   | 'codex'
   | 'claude'
@@ -234,6 +235,11 @@ export function PlatformOverviewTabsHeader({
       key: 'top-layout',
       label: t('codex.more.topLayoutTitle'),
       icon: <PanelTop className="tab-icon" />,
+    },
+    activityLogs: {
+      key: 'activityLogs',
+      label: t('workbuddy.activity.logs', '活动日志'),
+      icon: <FileText className="tab-icon" />,
     },
   };
   const tabSpecs: TabSpec[] = tabOrder.map((tab) => tabLabels[tab]);

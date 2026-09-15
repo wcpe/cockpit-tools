@@ -35,6 +35,7 @@ import {
   ArrowRightLeft,
   CalendarCheck,
   ShieldCheck,
+  Sparkles,
 } from "lucide-react";
 import { TagEditModal } from "../TagEditModal";
 import { ExportJsonModal } from "../ExportJsonModal";
@@ -174,6 +175,7 @@ export interface CodebuddySuiteAccountsPlatformConfig<
   oauthProviderControl?: ReactNode;
   showMfaQuickCode?: boolean;
   CheckinModal?: ComponentType<CheckinModalProps<TAccount>>;
+  ActivityCenterModal?: ComponentType<CheckinModalProps<TAccount>>;
   getReauthorizationReason?: (account: TAccount) => string | null;
   reauthorizingAccount?: TAccount | null;
   onReauthorize?: (account: TAccount) => void;
@@ -218,6 +220,7 @@ export function CodebuddySuiteAccountsSharedView<
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [showCheckinModal, setShowCheckinModal] = useState(false);
+  const [showActivityCenterModal, setShowActivityCenterModal] = useState(false);
 
   const {
     t,
@@ -377,6 +380,7 @@ export function CodebuddySuiteAccountsSharedView<
     void confirmDeleteTag();
   });
   useEscClose(showCheckinModal, () => setShowCheckinModal(false));
+  useEscClose(showActivityCenterModal, () => setShowActivityCenterModal(false));
 
   useEffect(() => {
     if (!filterPersistenceEnabled) {
@@ -910,6 +914,7 @@ export function CodebuddySuiteAccountsSharedView<
     });
 
   const CheckinModal = platformConfig.CheckinModal;
+  const ActivityCenterModal = platformConfig.ActivityCenterModal;
 
   return (
     <>
@@ -1114,6 +1119,16 @@ export function CodebuddySuiteAccountsSharedView<
               title={t("workbuddy.checkin.modalTitle", "每日签到")}
             >
               <CalendarCheck size={14} />
+            </button>
+          )}
+          {ActivityCenterModal && (
+            <button
+              className="btn btn-secondary icon-only"
+              onClick={() => setShowActivityCenterModal(true)}
+              disabled={accounts.length === 0}
+              title={t("workbuddy.activity.modalTitle", "活动中心")}
+            >
+              <Sparkles size={14} />
             </button>
           )}
           <button
@@ -2019,6 +2034,13 @@ export function CodebuddySuiteAccountsSharedView<
           accounts={filteredAccounts}
           onClose={() => setShowCheckinModal(false)}
           onCheckinComplete={onRefreshAccounts}
+        />
+      )}
+
+      {showActivityCenterModal && ActivityCenterModal && (
+        <ActivityCenterModal
+          accounts={filteredAccounts}
+          onClose={() => setShowActivityCenterModal(false)}
         />
       )}
     </>
