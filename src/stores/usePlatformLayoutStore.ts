@@ -316,7 +316,7 @@ function defaultPlatformGroups(): PlatformLayoutGroup[] {
     {
       id: DEFAULT_CODEBUDDY_GROUP_ID,
       name: 'CodeBuddy',
-      platformIds: ['codebuddy', 'codebuddy_cn', 'workbuddy'],
+      platformIds: ['codebuddy', 'codebuddy_cn', 'workbuddy', 'codebuddy_api_service'],
       defaultPlatformId: 'codebuddy',
       iconKind: 'platform',
       iconPlatformId: 'codebuddy',
@@ -352,6 +352,22 @@ function normalizeOrder(order: PlatformId[]): PlatformId[] {
 
 function defaultPlatformOrder(): PlatformId[] {
   return [...ALL_PLATFORM_IDS];
+}
+
+/**
+ * Keep the CodeBuddy/WorkBuddy API Service entry directly after `workbuddy` in
+ * an existing profile's platform order. Groups are sorted by this order, so it
+ * also controls where the entry appears inside the CodeBuddy suite.
+ * Idempotent: a no-op once the entry already follows WorkBuddy.
+ */
+function moveApiServiceEntryAfterWorkbuddy(order: PlatformId[]): void {
+  const apiServiceIndex = order.indexOf('codebuddy_api_service');
+  if (apiServiceIndex < 0) {
+    return;
+  }
+  order.splice(apiServiceIndex, 1);
+  const workbuddyIndex = order.indexOf('workbuddy');
+  order.splice(workbuddyIndex < 0 ? order.length : workbuddyIndex + 1, 0, 'codebuddy_api_service');
 }
 
 function defaultSidebarEntryIds(
@@ -689,6 +705,27 @@ function normalizePlatformGroups(
         codexGroup.platformIds,
       );
       usedPlatformIds.add('codex_api_service');
+    }
+  }
+
+  // Keep the CodeBuddy / WorkBuddy API Service reachable inside the CodeBuddy
+  // suite. Idempotent: it only fills a layout that does not carry the entry yet,
+  // which is the case for every profile created before the feature shipped.
+  if (!usedPlatformIds.has('codebuddy_api_service')) {
+    const codebuddyGroup = result.find((group) => group.platformIds.includes('codebuddy'));
+    if (codebuddyGroup) {
+      codebuddyGroup.platformIds = [...codebuddyGroup.platformIds, 'codebuddy_api_service'];
+      if (codebuddyGroup.iconKind !== 'custom' && !codebuddyGroup.iconPlatformId) {
+        codebuddyGroup.iconPlatformId = 'codebuddy';
+      }
+      if (!codebuddyGroup.platformIds.includes(codebuddyGroup.defaultPlatformId)) {
+        codebuddyGroup.defaultPlatformId = 'codebuddy';
+      }
+      codebuddyGroup.childConfigs = normalizeGroupChildConfigs(
+        codebuddyGroup.childConfigs ?? [],
+        codebuddyGroup.platformIds,
+      );
+      usedPlatformIds.add('codebuddy_api_service');
     }
   }
 
@@ -1256,6 +1293,8 @@ function loadPersistedState(): NormalizedLayoutStateData {
     const traeSuiteDefaultGroupRestored = parsed.traeSuiteDefaultGroupRestored === true;
     const codexApiServiceSuiteMigrated = parsed.codexApiServiceSuiteMigrated === true;
     const orderedPlatformIds = normalizeOrder(parsed.orderedPlatformIds ?? defaultPlatformOrder());
+    // API 服务入口跟随 WorkBuddy 展示（与「Codex API 服务」挂在 Codex 下方同理）。
+    moveApiServiceEntryAfterWorkbuddy(orderedPlatformIds);
     const hiddenPlatformIds = normalizeHidden(parsed.hiddenPlatformIds ?? []);
     const sidebarPlatformIds = normalizeSidebar(
       parsed.sidebarPlatformIds ?? defaultSidebarPlatformIds(),

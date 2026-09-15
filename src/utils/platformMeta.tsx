@@ -42,6 +42,8 @@ export function getPlatformLabel(platformId: PlatformId, _t: TFunction): string 
       return 'Grok CLI';
     case 'codebuddy':
       return 'CodeBuddy';
+    case 'codebuddy_api_service':
+      return _t('codebuddy.apiService.navTitle', 'WorkBuddy API 服务');
     case 'codebuddy_cn':
       return _t('nav.codebuddyCn', 'CodeBuddy CN');
     case 'qoder':
@@ -88,6 +90,8 @@ export function renderPlatformIcon(platformId: PlatformId, size = 20): ReactNode
     case 'grok':
       return <GrokIcon style={{ width: size, height: size }} />;
     case 'codebuddy':
+      return <CodebuddyIcon style={{ width: size, height: size }} />;
+    case 'codebuddy_api_service':
       return <CodebuddyIcon style={{ width: size, height: size }} />;
     case 'codebuddy_cn':
       return <CodebuddyIcon style={{ width: size, height: size }} />;

@@ -1027,6 +1027,9 @@ export function SettingsGeneralPanel(props: SettingsPageViewProps) {
                     <option value="codex-api-service">
                       {t('settings.general.startupPageCodexApi', 'Codex API 服务')}
                     </option>
+                    <option value="codebuddy-api-service">
+                      {t('codebuddy.apiService.navTitle', 'WorkBuddy API 服务')}
+                    </option>
                     <option value="claude">{t('nav.claude', 'Claude')}</option>
                     <option value="github-copilot">{t('nav.githubCopilot', 'GitHub Copilot')}</option>
                     <option value="windsurf">{t('nav.windsurf', 'Devin')}</option>

@@ -118,6 +118,11 @@ const CodexAccountsPage = lazy(() =>
 const CodexApiServicePage = lazy(() =>
   import('./pages/CodexApiServicePage').then((module) => ({ default: module.CodexApiServicePage })),
 );
+const CodebuddyApiServicePage = lazy(() =>
+  import('./pages/CodebuddyApiServicePage').then((module) => ({
+    default: module.CodebuddyApiServicePage,
+  })),
+);
 const ClaudeAccountsPage = lazy(() =>
   import('./pages/ClaudeAccountsPage').then((module) => ({ default: module.ClaudeAccountsPage })),
 );
@@ -212,6 +217,7 @@ const RENDERABLE_PAGE_VALUES: readonly Page[] = [
   'claude',
   'claude-cli',
   'codex-api-service',
+  'codebuddy-api-service',
   'github-copilot',
   'windsurf',
   'kiro',
@@ -244,6 +250,7 @@ const TOP_PROMO_PAGE_PLATFORM_TARGETS: Partial<Record<Page, readonly string[]>> 
   verification: ['antigravity', 'antigravity-ide'],
   codex: ['codex'],
   'codex-api-service': ['codex_api_service', 'codex'],
+  'codebuddy-api-service': ['codebuddy_api_service'],
   'codex-instances': ['codex'],
   claude: ['claude', 'claude-manager'],
   'claude-cli': ['claude', 'claude-manager'],
@@ -4056,6 +4063,9 @@ function MainApp() {
               </div>
             </Suspense>
           )}
+          <VisibleBootPage when={page === 'codebuddy-api-service'}>
+            <CodebuddyApiServicePage />
+          </VisibleBootPage>
           <VisibleBootPage when={page === 'claude'}>
             <ClaudeAccountsPage subPlatform="desktop" />
           </VisibleBootPage>

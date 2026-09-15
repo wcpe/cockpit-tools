@@ -13,6 +13,7 @@ export type PlatformId =
   | 'cursor'
   | 'grok'
   | 'codebuddy'
+  | 'codebuddy_api_service'
   | 'codebuddy_cn'
   | 'qoder'
   | 'zcode'
@@ -43,10 +44,14 @@ export const ALL_PLATFORM_IDS: PlatformId[] = [
   'trae_cn',
   'trae_solo_cn',
   'workbuddy',
+  'codebuddy_api_service',
 ];
 
 /** Platforms that do not own account lists (service / feature pages). */
-export const ACCOUNTLESS_PLATFORM_IDS: readonly PlatformId[] = ['codex_api_service'];
+export const ACCOUNTLESS_PLATFORM_IDS: readonly PlatformId[] = [
+  'codex_api_service',
+  'codebuddy_api_service',
+];
 
 export function isAccountPlatform(platformId: PlatformId): boolean {
   return !ACCOUNTLESS_PLATFORM_IDS.includes(platformId);
@@ -75,6 +80,7 @@ export const PLATFORM_PAGE_MAP: Record<PlatformId, Page> = {
   cursor: 'cursor',
   grok: 'grok',
   codebuddy: 'codebuddy',
+  codebuddy_api_service: 'codebuddy-api-service',
   codebuddy_cn: 'codebuddy-cn',
   qoder: 'qoder',
   zcode: 'zcode',

@@ -14,6 +14,7 @@ export type Page =
   | 'cursor'
   | 'grok'
   | 'codebuddy'
+  | 'codebuddy-api-service'
   | 'codebuddy-cn'
   | 'qoder'
   | 'zcode'
@@ -47,6 +48,7 @@ export const MAIN_WINDOW_NAVIGABLE_PAGES: readonly Page[] = [
   'cursor',
   'grok',
   'codebuddy',
+  'codebuddy-api-service',
   'codebuddy-cn',
   'qoder',
   'zcode',
