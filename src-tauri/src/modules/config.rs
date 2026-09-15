@@ -819,6 +819,7 @@ pub fn normalize_startup_page(value: &str) -> String {
         "cursor",
         "grok",
         "codebuddy",
+        "codebuddy-api-service",
         "codebuddy-cn",
         "qoder",
         "zcode",

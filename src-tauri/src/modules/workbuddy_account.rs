@@ -111,6 +111,31 @@ fn save_account_file(account: &WorkbuddyAccount) -> Result<(), String> {
         .map_err(|e| format!("保存账号失败:{}", e))
 }
 
+/// Persist a rotated token pair produced outside this module (for example by
+/// the local API service sidecar refreshing on a 401). Keeps the account store
+/// authoritative so a rotated refresh token is never lost.
+pub fn persist_refreshed_tokens(
+    account_id: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_at_ms: Option<i64>,
+) -> Result<WorkbuddyAccount, String> {
+    let mut account =
+        load_account(account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
+    let access_token = access_token.trim();
+    if !access_token.is_empty() {
+        account.access_token = access_token.to_string();
+    }
+    if let Some(refresh_token) = refresh_token.map(str::trim).filter(|value| !value.is_empty()) {
+        account.refresh_token = Some(refresh_token.to_string());
+    }
+    if let Some(expires_at_ms) = expires_at_ms.filter(|value| *value > 0) {
+        account.expires_at = Some(expires_at_ms);
+    }
+    save_account_file(&account)?;
+    Ok(account)
+}
+
 fn delete_account_file(account_id: &str) -> Result<(), String> {
     let path = resolve_account_file_path(account_id)?;
     if path.exists() {

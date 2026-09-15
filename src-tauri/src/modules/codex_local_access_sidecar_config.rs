@@ -349,7 +349,7 @@ fn sidecar_binary_candidates() -> Result<Vec<PathBuf>, String> {
     Ok(candidates)
 }
 
-fn sidecar_binary_path() -> Result<PathBuf, String> {
+pub(crate) fn sidecar_binary_path() -> Result<PathBuf, String> {
     let candidates = sidecar_binary_candidates()?;
     candidates
         .iter()
@@ -367,7 +367,7 @@ fn sidecar_binary_path() -> Result<PathBuf, String> {
         })
 }
 
-fn sanitize_sidecar_command_env(command: &mut TokioCommand) {
+pub(crate) fn sanitize_sidecar_command_env(command: &mut TokioCommand) {
     #[cfg(target_os = "macos")]
     {
         // 避免把 Cockpit 的应用身份和 XPC 上下文传给 sidecar，导致局域网访问异常。

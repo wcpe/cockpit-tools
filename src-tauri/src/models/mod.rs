@@ -2,6 +2,7 @@ pub mod account;
 pub mod claude;
 pub mod codebuddy;
 pub mod codex;
+pub mod codebuddy_local_access;
 pub mod codex_local_access;
 pub mod cursor;
 pub mod github_copilot;

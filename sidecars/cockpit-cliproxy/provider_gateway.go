@@ -69,6 +69,15 @@ func (s *relayServer) handleExecutorBody(c *gin.Context, spec *apiKeySpec, body 
 		writeAPIError(c, http.StatusUnauthorized, "missing or invalid API key", "invalid_api_key")
 		return
 	}
+	if isCodebuddyAPIKey(spec) {
+		if !sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI) {
+			writeAPIError(c, http.StatusBadRequest,
+				"CodeBuddy upstream only supports OpenAI chat completions requests", "invalid_request")
+			return
+		}
+		s.handleCodebuddyChat(c, spec, body)
+		return
+	}
 	model := requestBodyModel(body)
 	if model == "" {
 		writeAPIError(c, http.StatusBadRequest, "model is required", "invalid_request")

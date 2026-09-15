@@ -514,6 +514,11 @@ pub fn run() {
                 }
             });
 
+            // CodeBuddy / WorkBuddy 本地 API 服务：应用启动时按持久化配置恢复
+            tauri::async_runtime::spawn(async {
+                modules::codebuddy_local_access::reconcile().await;
+            });
+
             commands::codex_instance::start_mixed_model_gateway_watchdog(app.handle().clone());
 
             {
@@ -685,6 +690,9 @@ pub fn run() {
 
             apply_startup_minimized(&app.handle());
             modules::workbuddy_auto_checkin::start_auto_checkin_scheduler(app.handle().clone());
+            modules::workbuddy_scheduler::start_workbuddy_activity_scheduler(
+                app.handle().clone(),
+            );
 
             Ok(())
         })
@@ -1253,6 +1261,16 @@ pub fn run() {
             commands::kiro::inject_kiro_to_vscode,
             // CodeBuddy Commands
             commands::codebuddy::list_codebuddy_accounts,
+            commands::codebuddy_local_access::codebuddy_local_access_get_state,
+            commands::codebuddy_local_access::codebuddy_local_access_save,
+            commands::codebuddy_local_access::codebuddy_local_access_start,
+            commands::codebuddy_local_access::codebuddy_local_access_stop,
+            commands::codebuddy_local_access::codebuddy_local_access_restart,
+            commands::codebuddy_local_access::codebuddy_local_access_rotate_api_key,
+            commands::codebuddy_local_access::codebuddy_local_access_test,
+            commands::codebuddy_local_access::codebuddy_local_access_fetch_models,
+            commands::codebuddy_local_access::codebuddy_local_access_probe_chat,
+            commands::codebuddy_local_access::codebuddy_local_access_default_models,
             commands::codebuddy::delete_codebuddy_account,
             commands::codebuddy::delete_codebuddy_accounts,
             commands::codebuddy::import_codebuddy_from_json,
@@ -1321,6 +1339,23 @@ pub fn run() {
             commands::workbuddy::get_workbuddy_auto_checkin_logs,
             commands::workbuddy::clear_workbuddy_auto_checkin_logs,
             commands::workbuddy::run_workbuddy_auto_checkin_now,
+            // WorkBuddy Activity Center Commands
+            commands::workbuddy_activity::workbuddy_activity_overview,
+            commands::workbuddy_activity::workbuddy_activity_run_growth,
+            commands::workbuddy_activity::workbuddy_activity_cat_travel,
+            commands::workbuddy_activity::workbuddy_activity_run_checkin,
+            commands::workbuddy_activity::workbuddy_activity_run_activity_report,
+            commands::workbuddy_activity::workbuddy_activity_run_night_cat,
+            commands::workbuddy_activity::workbuddy_activity_run_task,
+            commands::workbuddy_activity::workbuddy_activity_get_schedule,
+            commands::workbuddy_activity::workbuddy_activity_update_schedule,
+            commands::workbuddy_activity::workbuddy_activity_run_schedule_now,
+            commands::workbuddy_activity::workbuddy_activity_get_logs,
+            commands::workbuddy_activity::workbuddy_activity_clear_logs,
+            commands::workbuddy_activity::workbuddy_activity_overview_all,
+            commands::workbuddy_activity::workbuddy_activity_run_kind_all,
+            commands::workbuddy_activity::workbuddy_activity_run_daily_all,
+            commands::workbuddy_activity::workbuddy_activity_clear_overview_cache,
             // WorkBuddy Instance Commands
             commands::workbuddy_instance::workbuddy_get_instance_defaults,
             commands::workbuddy_instance::workbuddy_list_instances,
@@ -1619,6 +1654,7 @@ pub fn run() {
                     }
                     modules::codex_app_injection::stop_all();
                     modules::codex_proxy_engine::shutdown_all();
+                    modules::codebuddy_local_access::stop_service_on_shutdown();
                     tauri::async_runtime::spawn(async {
                         modules::codex_local_access::shutdown_local_access_gateway_for_app_exit()
                             .await;
@@ -1632,6 +1668,7 @@ pub fn run() {
                 }
                 modules::codex_app_injection::stop_all();
                 modules::codex_proxy_engine::shutdown_all();
+                modules::codebuddy_local_access::stop_service_on_shutdown();
                 tauri::async_runtime::spawn(async {
                     modules::codex_local_access::shutdown_local_access_gateway_for_app_exit().await;
                 });

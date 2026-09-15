@@ -118,6 +118,7 @@ func main() {
 	flag.Parse()
 
 	emitter := &eventEmitter{}
+	globalCodebuddyEmitter = emitter
 	if strings.TrimSpace(*configPath) == "" || strings.TrimSpace(*manifestPath) == "" {
 		emitter.emit(map[string]any{"type": "error", "message": "missing --config or --manifest"})
 		os.Exit(2)

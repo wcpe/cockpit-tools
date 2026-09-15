@@ -1,0 +1,1384 @@
+//! CodeBuddy / CodeBuddy CN / WorkBuddy local API service.
+//!
+//! This mirrors the Codex API Service pattern: Cockpit materializes a manifest
+//! for the bundled `cockpit-cliproxy` sidecar and starts it on a loopback (or
+//! LAN) port. The sidecar speaks the CodeBuddy wire protocol
+//! (`POST /v2/chat/completions` with a JWT bearer token) and exposes an
+//! OpenAI-compatible `/v1` surface to third-party clients.
+//!
+//! Cockpit remains the token authority: it materializes account JWTs into the
+//! manifest and persists any token the sidecar rotates after a 401, so the
+//! account store never drifts from the live credential.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command as TokioCommand};
+use tokio::sync::Mutex;
+
+use crate::models::codebuddy_local_access::{
+    CodebuddyFetchModelsAccountResult, CodebuddyFetchModelsResult, CodebuddyLocalAccessAccountOption,
+    CodebuddyLocalAccessAccountRef, CodebuddyLocalAccessCollection, CodebuddyLocalAccessPlatform,
+    CodebuddyLocalAccessScope, CodebuddyLocalAccessState, CodebuddyLocalAccessTestResult,
+    CodebuddyModelInfo, CodebuddyProbeResult, CODEBUDDY_DEFAULT_MODEL_IDS,
+};
+use crate::modules::codex_local_access::{sanitize_sidecar_command_env, sidecar_binary_path};
+use crate::modules::{
+    account, atomic_write, codebuddy_account, codebuddy_cn_account, logger, workbuddy_account,
+};
+
+const STATE_FILE: &str = "codebuddy_local_access.json";
+const RUNTIME_DIR: &str = "codebuddy_local_access_sidecar";
+const SIDECAR_CONFIG_FILE: &str = "config.json";
+const SIDECAR_MANIFEST_FILE: &str = "manifest.json";
+const SIDECAR_AUTHS_DIR: &str = "auths";
+const SIDECAR_API_KEY_ID: &str = "codebuddy_api_service";
+const LOCALHOST_BIND_HOST: &str = "127.0.0.1";
+const LAN_BIND_HOST: &str = "0.0.0.0";
+const CLIENT_URL_HOST: &str = "127.0.0.1";
+const SIDECAR_READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Refresh a selected account when its JWT expires within this window.
+const TOKEN_REFRESH_WINDOW_MS: i64 = 6 * 60 * 60 * 1000;
+
+#[derive(Default)]
+struct ServiceRuntime {
+    running: bool,
+    port: Option<u16>,
+    bind_host: Option<String>,
+    last_error: Option<String>,
+    child: Option<Child>,
+}
+
+impl ServiceRuntime {
+    fn base_url(&self) -> Option<String> {
+        self.port
+            .map(|port| format!("http://{}:{}", CLIENT_URL_HOST, port))
+    }
+}
+
+fn runtime() -> &'static Mutex<ServiceRuntime> {
+    static RUNTIME: OnceLock<Mutex<ServiceRuntime>> = OnceLock::new();
+    RUNTIME.get_or_init(|| Mutex::new(ServiceRuntime::default()))
+}
+
+fn lifecycle_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub fn state_path() -> Result<PathBuf, String> {
+    Ok(account::get_data_dir()?.join(STATE_FILE))
+}
+
+fn runtime_dir() -> Result<PathBuf, String> {
+    Ok(account::get_data_dir()?.join(RUNTIME_DIR))
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn generate_api_key() -> String {
+    use rand::Rng;
+    let bytes: Vec<u8> = (0..24).map(|_| rand::thread_rng().gen::<u8>()).collect();
+    format!(
+        "cbk-{}",
+        bytes
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>()
+    )
+}
+
+fn normalize_collection(collection: &mut CodebuddyLocalAccessCollection) {
+    if collection.port == 0 {
+        collection.port = CodebuddyLocalAccessCollection::default().port;
+    }
+    collection.api_key = collection.api_key.trim().to_string();
+    if collection.api_key.is_empty() {
+        collection.api_key = generate_api_key();
+    }
+    collection.model_ids = normalize_model_ids(&collection.model_ids);
+    let mut seen = std::collections::HashSet::new();
+    collection.accounts.retain(|entry| {
+        !entry.account_id.trim().is_empty()
+            && seen.insert((entry.platform.as_str(), entry.account_id.clone()))
+    });
+}
+
+fn normalize_model_ids(values: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_lowercase()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+pub fn load_collection() -> CodebuddyLocalAccessCollection {
+    let Ok(path) = state_path() else {
+        return CodebuddyLocalAccessCollection::default();
+    };
+    if !path.exists() {
+        return CodebuddyLocalAccessCollection::default();
+    }
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return CodebuddyLocalAccessCollection::default();
+    };
+    match serde_json::from_str::<CodebuddyLocalAccessCollection>(&content) {
+        Ok(mut collection) => {
+            normalize_collection(&mut collection);
+            collection
+        }
+        Err(error) => {
+            logger::log_codex_api_warn(&format!(
+                "[CodebuddyLocalAccess] 读取配置失败，使用默认值: {}",
+                error
+            ));
+            CodebuddyLocalAccessCollection::default()
+        }
+    }
+}
+
+pub fn save_collection(collection: &CodebuddyLocalAccessCollection) -> Result<(), String> {
+    let path = state_path()?;
+    let content = serde_json::to_string_pretty(collection)
+        .map_err(|error| format!("序列化配置失败: {}", error))?;
+    atomic_write::write_string_atomic(&path, &content)
+}
+
+/// Decode the `exp` claim of a JWT (milliseconds since epoch).
+fn jwt_exp_ms(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload.trim()).ok()?;
+    let value: Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = value.get("exp")?.as_i64()?;
+    if exp <= 0 {
+        return None;
+    }
+    Some(exp.saturating_mul(1000))
+}
+
+struct ResolvedAccount {
+    label: String,
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at_ms: Option<i64>,
+}
+
+fn resolve_account(
+    platform: CodebuddyLocalAccessPlatform,
+    account_id: &str,
+) -> Result<ResolvedAccount, String> {
+    let missing = || format!("账号不存在或已删除: {}", account_id);
+    let resolved = match platform {
+        CodebuddyLocalAccessPlatform::Workbuddy => {
+            let account = workbuddy_account::load_account(account_id).ok_or_else(missing)?;
+            ResolvedAccount {
+                label: account.email.clone(),
+                access_token: account.access_token,
+                refresh_token: account.refresh_token,
+                expires_at_ms: account.expires_at,
+            }
+        }
+        CodebuddyLocalAccessPlatform::CodebuddyCn => {
+            let account = codebuddy_cn_account::load_account(account_id).ok_or_else(missing)?;
+            ResolvedAccount {
+                label: account.email.clone(),
+                access_token: account.access_token,
+                refresh_token: account.refresh_token,
+                expires_at_ms: account.expires_at,
+            }
+        }
+        CodebuddyLocalAccessPlatform::Codebuddy => {
+            let account = codebuddy_account::load_account(account_id).ok_or_else(missing)?;
+            ResolvedAccount {
+                label: account.email.clone(),
+                access_token: account.access_token,
+                refresh_token: account.refresh_token,
+                expires_at_ms: account.expires_at,
+            }
+        }
+    };
+    if resolved.access_token.trim().is_empty() {
+        return Err(format!("账号 {} 缺少访问令牌", account_id));
+    }
+    Ok(resolved)
+}
+
+async fn refresh_account(
+    platform: CodebuddyLocalAccessPlatform,
+    account_id: &str,
+) -> Result<(), String> {
+    match platform {
+        CodebuddyLocalAccessPlatform::Workbuddy => {
+            workbuddy_account::refresh_account_token(account_id)
+                .await
+                .map(|_| ())
+        }
+        CodebuddyLocalAccessPlatform::CodebuddyCn => {
+            codebuddy_cn_account::refresh_account_token(account_id)
+                .await
+                .map(|_| ())
+        }
+        CodebuddyLocalAccessPlatform::Codebuddy => {
+            codebuddy_account::refresh_account_token(account_id)
+                .await
+                .map(|_| ())
+        }
+    }
+}
+
+fn persist_rotated_tokens(
+    platform: CodebuddyLocalAccessPlatform,
+    account_id: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_at_ms: Option<i64>,
+) -> Result<(), String> {
+    match platform {
+        CodebuddyLocalAccessPlatform::Workbuddy => workbuddy_account::persist_refreshed_tokens(
+            account_id,
+            access_token,
+            refresh_token,
+            expires_at_ms,
+        )
+        .map(|_| ()),
+        CodebuddyLocalAccessPlatform::CodebuddyCn => {
+            codebuddy_cn_account::persist_refreshed_tokens(
+                account_id,
+                access_token,
+                refresh_token,
+                expires_at_ms,
+            )
+            .map(|_| ())
+        }
+        CodebuddyLocalAccessPlatform::Codebuddy => codebuddy_account::persist_refreshed_tokens(
+            account_id,
+            access_token,
+            refresh_token,
+            expires_at_ms,
+        )
+        .map(|_| ()),
+    }
+}
+
+/// Refresh selected accounts whose JWT is missing its expiry or is about to
+/// expire. A failed refresh keeps the existing token so the service can still
+/// start (the upstream error is surfaced on the first request).
+async fn refresh_expiring_accounts(collection: &CodebuddyLocalAccessCollection) {
+    for entry in &collection.accounts {
+        let Ok(resolved) = resolve_account(entry.platform, &entry.account_id) else {
+            continue;
+        };
+        let expiry = resolved
+            .expires_at_ms
+            .filter(|value| *value > 0)
+            .or_else(|| jwt_exp_ms(&resolved.access_token));
+        let Some(expiry) = expiry else {
+            continue;
+        };
+        if expiry - now_ms() > TOKEN_REFRESH_WINDOW_MS {
+            continue;
+        }
+        if let Err(error) = refresh_account(entry.platform, &entry.account_id).await {
+            logger::log_codex_api_warn(&format!(
+                "[CodebuddyLocalAccess] 刷新账号令牌失败 account={} platform={} error={}",
+                entry.account_id,
+                entry.platform.as_str(),
+                error
+            ));
+        }
+    }
+}
+
+fn bind_host_for_scope(scope: CodebuddyLocalAccessScope) -> &'static str {
+    match scope {
+        CodebuddyLocalAccessScope::Localhost => LOCALHOST_BIND_HOST,
+        CodebuddyLocalAccessScope::Lan => LAN_BIND_HOST,
+    }
+}
+
+fn build_manifest(collection: &CodebuddyLocalAccessCollection) -> Result<Value, String> {
+    let mut upstreams = Vec::new();
+    for entry in &collection.accounts {
+        let resolved = resolve_account(entry.platform, &entry.account_id)?;
+        upstreams.push(json!({
+            "id": entry.account_id,
+            "label": entry
+                .label
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| resolved.label.clone()),
+            "platform": entry.platform.as_str(),
+            "baseUrl": entry.platform.default_base_url(),
+            "accessToken": resolved.access_token,
+            "refreshToken": resolved.refresh_token,
+            "includeReasoning": collection.include_reasoning,
+        }));
+    }
+    if upstreams.is_empty() {
+        return Err("请至少选择一个 CodeBuddy / WorkBuddy 账号".to_string());
+    }
+
+    let mut manifest = json!({
+        "locale": "zh-CN",
+        "apiKeys": [{
+            "id": SIDECAR_API_KEY_ID,
+            "label": "CodeBuddy API Service",
+            "key": collection.api_key,
+            "enabled": true,
+            "upstreamKind": "codebuddy",
+            "accountIds": [],
+            "allowedModels": [],
+            "excludedModels": [],
+        }],
+        "accounts": [],
+        "modelIds": [],
+        "routingStrategy": match collection.routing_strategy {
+            crate::models::codebuddy_local_access::CodebuddyLocalAccessRoutingStrategy::Random => "random",
+            _ => "round_robin",
+        },
+        "debugLogs": true,
+        "codebuddyUpstreams": upstreams,
+    });
+    if !collection.model_ids.is_empty() {
+        // Only override the account-level catalog when the user curated one.
+        if let Some(list) = manifest
+            .get_mut("codebuddyUpstreams")
+            .and_then(|value| value.as_array_mut())
+        {
+            for upstream in list.iter_mut() {
+                if let Some(object) = upstream.as_object_mut() {
+                    object.insert("modelIds".to_string(), json!(collection.model_ids));
+                }
+            }
+        }
+    }
+    Ok(manifest)
+}
+
+fn sidecar_config(collection: &CodebuddyLocalAccessCollection, auth_dir: &Path) -> Value {
+    json!({
+        "host": bind_host_for_scope(collection.access_scope),
+        "port": collection.port,
+        "auth-dir": auth_dir.to_string_lossy(),
+        "debug": false,
+        "api-keys": [collection.api_key],
+        "api-key-account-ids": [SIDECAR_API_KEY_ID],
+        "commercial-mode": true,
+        "ws-auth": true,
+        "disable-auth-auto-refresh": true,
+    })
+}
+
+fn write_runtime_files(
+    collection: &CodebuddyLocalAccessCollection,
+) -> Result<(PathBuf, PathBuf), String> {
+    let dir = runtime_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|error| format!("创建运行目录失败: {}", error))?;
+    let auth_dir = dir.join(SIDECAR_AUTHS_DIR);
+    std::fs::create_dir_all(&auth_dir).map_err(|error| format!("创建认证目录失败: {}", error))?;
+
+    let config_path = dir.join(SIDECAR_CONFIG_FILE);
+    let manifest_path = dir.join(SIDECAR_MANIFEST_FILE);
+
+    let config = sidecar_config(collection, &auth_dir);
+    let config_text = serde_json::to_string_pretty(&config)
+        .map_err(|error| format!("序列化配置失败: {}", error))?;
+    atomic_write::write_string_atomic(&config_path, &config_text)?;
+
+    let manifest = build_manifest(collection)?;
+    let manifest_text = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("序列化清单失败: {}", error))?;
+    atomic_write::write_string_atomic(&manifest_path, &manifest_text)?;
+
+    Ok((config_path, manifest_path))
+}
+
+/// Handle one JSON line emitted by the sidecar on stdout.
+async fn handle_sidecar_event(collection: &CodebuddyLocalAccessCollection, line: &str) {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return;
+    }
+    let Ok(payload) = serde_json::from_str::<Value>(trimmed) else {
+        return;
+    };
+    match payload.get("type").and_then(Value::as_str) {
+        Some("ready") => {
+            if let Some(port) = payload.get("port").and_then(Value::as_u64) {
+                let mut runtime = runtime().lock().await;
+                runtime.port = Some(port as u16);
+                runtime.bind_host = payload
+                    .get("host")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+        Some("codebuddy_token_refreshed") => {
+            let Some(upstream_id) = payload.get("upstreamId").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(access_token) = payload.get("accessToken").and_then(Value::as_str) else {
+                return;
+            };
+            let refresh_token = payload.get("refreshToken").and_then(Value::as_str);
+            let Some(entry) = collection
+                .accounts
+                .iter()
+                .find(|entry| entry.account_id == upstream_id)
+            else {
+                return;
+            };
+            let expires_at_ms = jwt_exp_ms(access_token);
+            match persist_rotated_tokens(
+                entry.platform,
+                upstream_id,
+                access_token,
+                refresh_token,
+                expires_at_ms,
+            ) {
+                Ok(()) => logger::log_codex_api_info(&format!(
+                    "[CodebuddyLocalAccess] 已回写续期令牌 account={}",
+                    upstream_id
+                )),
+                Err(error) => logger::log_codex_api_warn(&format!(
+                    "[CodebuddyLocalAccess] 回写续期令牌失败 account={} error={}",
+                    upstream_id, error
+                )),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn spawn_sidecar_event_reader(
+    child: &mut Child,
+    collection: Arc<CodebuddyLocalAccessCollection>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let stdout = child.stdout.take()?;
+    Some(tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            handle_sidecar_event(&collection, &line).await;
+        }
+    }))
+}
+
+async fn stop_sidecar_locked(runtime: &mut ServiceRuntime) {
+    if let Some(mut child) = runtime.child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    runtime.running = false;
+    runtime.port = None;
+}
+
+async fn wait_for_ready(port: u16, api_key: &str) -> Result<(), String> {
+    let url = format!("http://{}:{}/v1/models", CLIENT_URL_HOST, port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+        .map_err(|error| format!("创建健康检查客户端失败: {}", error))?;
+    let deadline = Instant::now() + SIDECAR_READY_TIMEOUT;
+    let mut last_error = String::from("sidecar 未在超时时间内就绪");
+    while Instant::now() < deadline {
+        match client.get(&url).bearer_auth(api_key.trim()).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => last_error = format!("HTTP {}", response.status()),
+            Err(error) => last_error = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(last_error)
+}
+
+pub async fn start_service(collection: &CodebuddyLocalAccessCollection) -> Result<(), String> {
+    let _guard = lifecycle_lock().lock().await;
+    refresh_expiring_accounts(collection).await;
+    let (config_path, manifest_path) = write_runtime_files(collection)?;
+    let binary = sidecar_binary_path()?;
+
+    {
+        let mut runtime = runtime().lock().await;
+        stop_sidecar_locked(&mut runtime).await;
+    }
+
+    let mut command = TokioCommand::new(&binary);
+    sanitize_sidecar_command_env(&mut command);
+    command
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .current_dir(config_path.parent().unwrap_or_else(|| Path::new(".")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(0x08000000);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动 CodeBuddy API 服务失败: {}", error))?;
+    let collection = Arc::new(collection.clone());
+    if let Some(reader) = spawn_sidecar_event_reader(&mut child, Arc::clone(&collection)) {
+        // The reader owns stdout; the child handle stays in the runtime.
+        drop(reader);
+    }
+
+    {
+        let mut runtime = runtime().lock().await;
+        runtime.child = Some(child);
+        runtime.running = true;
+        runtime.port = Some(collection.port);
+        runtime.bind_host = Some(bind_host_for_scope(collection.access_scope).to_string());
+        runtime.last_error = None;
+    }
+
+    if let Err(error) = wait_for_ready(collection.port, &collection.api_key).await {
+        let mut runtime = runtime().lock().await;
+        stop_sidecar_locked(&mut runtime).await;
+        runtime.last_error = Some(error.clone());
+        logger::log_codex_api_error(&format!("[CodebuddyLocalAccess] 启动失败: {}", error));
+        return Err(error);
+    }
+    logger::log_codex_api_info(&format!(
+        "[CodebuddyLocalAccess] 服务已启动 port={} accounts={}",
+        collection.port,
+        collection.accounts.len()
+    ));
+    Ok(())
+}
+
+pub async fn stop_service() -> Result<(), String> {
+    let _guard = lifecycle_lock().lock().await;
+    let mut runtime = runtime().lock().await;
+    stop_sidecar_locked(&mut runtime).await;
+    runtime.last_error = None;
+    Ok(())
+}
+
+pub async fn restart_service(collection: &CodebuddyLocalAccessCollection) -> Result<(), String> {
+    stop_service().await?;
+    start_service(collection).await
+}
+
+/// Bring the process in line with `collection.enabled`.
+pub async fn reconcile() {
+    let collection = load_collection();
+    let running = {
+        let runtime = runtime().lock().await;
+        runtime.running
+    };
+    if collection.enabled && !running {
+        if let Err(error) = start_service(&collection).await {
+            logger::log_codex_api_warn(&format!("[CodebuddyLocalAccess] 自动启动失败: {}", error));
+        }
+    } else if !collection.enabled && running {
+        let _ = stop_service().await;
+    }
+}
+
+pub fn stop_service_on_shutdown() {
+    if let Ok(mut runtime) = runtime().try_lock() {
+        if let Some(child) = runtime.child.as_mut() {
+            let _ = child.start_kill();
+        }
+        runtime.running = false;
+    }
+}
+
+fn account_options(
+    collection: &CodebuddyLocalAccessCollection,
+) -> Vec<CodebuddyLocalAccessAccountOption> {
+    let selected: std::collections::HashSet<(String, String)> = collection
+        .accounts
+        .iter()
+        .map(|entry| {
+            (
+                entry.platform.as_str().to_string(),
+                entry.account_id.clone(),
+            )
+        })
+        .collect();
+
+    let mut options = Vec::new();
+    let mut push = |platform: CodebuddyLocalAccessPlatform,
+                    account_id: String,
+                    label: String,
+                    token: String,
+                    expires_at: Option<i64>| {
+        let token = token.trim().to_string();
+        let expires_at_ms = expires_at
+            .filter(|value| *value > 0)
+            .or_else(|| jwt_exp_ms(&token));
+        options.push(CodebuddyLocalAccessAccountOption {
+            platform,
+            platform_name: platform.display_name().to_string(),
+            account_id: account_id.clone(),
+            label,
+            selected: selected.contains(&(platform.as_str().to_string(), account_id)),
+            token_available: !token.is_empty(),
+            expires_at_ms,
+        });
+    };
+
+    for account in workbuddy_account::list_accounts() {
+        push(
+            CodebuddyLocalAccessPlatform::Workbuddy,
+            account.id.clone(),
+            account.email.clone(),
+            account.access_token.clone(),
+            account.expires_at,
+        );
+    }
+    for account in codebuddy_cn_account::list_accounts() {
+        push(
+            CodebuddyLocalAccessPlatform::CodebuddyCn,
+            account.id.clone(),
+            account.email.clone(),
+            account.access_token.clone(),
+            account.expires_at,
+        );
+    }
+    for account in codebuddy_account::list_accounts() {
+        push(
+            CodebuddyLocalAccessPlatform::Codebuddy,
+            account.id.clone(),
+            account.email.clone(),
+            account.access_token.clone(),
+            account.expires_at,
+        );
+    }
+    options
+}
+
+pub fn current_model_ids(collection: &CodebuddyLocalAccessCollection) -> Vec<String> {
+    if !collection.model_ids.is_empty() {
+        return collection.model_ids.clone();
+    }
+    CODEBUDDY_DEFAULT_MODEL_IDS
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+pub async fn service_state() -> CodebuddyLocalAccessState {
+    let collection = load_collection();
+    let (running, base_url, bind_host, last_error) = {
+        let runtime = runtime().lock().await;
+        (
+            runtime.running,
+            runtime.base_url(),
+            runtime.bind_host.clone(),
+            runtime.last_error.clone(),
+        )
+    };
+    let lan_base_url = match bind_host.as_deref() {
+        Some(LAN_BIND_HOST) => {
+            let port = {
+                let runtime = runtime().lock().await;
+                runtime.port
+            };
+            port.map(|port| format!("http://<本机局域网IP>:{}", port))
+        }
+        _ => None,
+    };
+    CodebuddyLocalAccessState {
+        available_accounts: account_options(&collection),
+        model_ids: current_model_ids(&collection),
+        collection,
+        running,
+        base_url,
+        lan_base_url,
+        last_error,
+    }
+}
+
+/// Probe the running service. Uses `/v1/models` so the check never spends
+/// subscription credit.
+pub async fn test_service() -> CodebuddyLocalAccessTestResult {
+    let collection = load_collection();
+    let (running, base_url) = {
+        let runtime = runtime().lock().await;
+        (runtime.running, runtime.base_url())
+    };
+    if !running {
+        return CodebuddyLocalAccessTestResult {
+            ok: false,
+            status: None,
+            message: "服务未运行".to_string(),
+            latency_ms: None,
+            content: None,
+        };
+    }
+    let Some(base_url) = base_url else {
+        return CodebuddyLocalAccessTestResult {
+            ok: false,
+            status: None,
+            message: "服务端口未知".to_string(),
+            latency_ms: None,
+            content: None,
+        };
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return CodebuddyLocalAccessTestResult {
+                ok: false,
+                status: None,
+                message: format!("创建测试客户端失败: {}", error),
+                latency_ms: None,
+                content: None,
+            }
+        }
+    };
+    let started = Instant::now();
+    match client
+        .get(format!("{}/v1/models", base_url))
+        .bearer_auth(collection.api_key.trim())
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            CodebuddyLocalAccessTestResult {
+                ok: status.is_success(),
+                status: Some(status.as_u16()),
+                message: if status.is_success() {
+                    "服务响应正常".to_string()
+                } else {
+                    format!("服务返回 HTTP {}", status.as_u16())
+                },
+                latency_ms: Some(started.elapsed().as_millis() as u64),
+                content: Some(truncate(&body, 2000)),
+            }
+        }
+        Err(error) => CodebuddyLocalAccessTestResult {
+            ok: false,
+            status: None,
+            message: format!("请求失败: {}", error),
+            latency_ms: Some(started.elapsed().as_millis() as u64),
+            content: None,
+        },
+    }
+}
+
+fn truncate(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    value.chars().take(limit).collect()
+}
+
+/// Update the collection and synchronize the running process with it.
+///
+/// Enabling (or saving while enabled) always performs a controlled restart so
+/// the regenerated manifest takes effect; `start_service` stops the previous
+/// child first, so this is safe to call on every save.
+pub async fn apply_collection(
+    mut next: CodebuddyLocalAccessCollection,
+) -> Result<CodebuddyLocalAccessState, String> {
+    normalize_collection(&mut next);
+    save_collection(&next)?;
+    if next.enabled {
+        start_service(&next).await?;
+    } else {
+        stop_service().await?;
+    }
+    Ok(service_state().await)
+}
+
+// ── 上游模型目录 + 探测 ────────────────────────────────────────
+//
+// 上游 CLI 暴露的可用模型不在 `/v3/config`（对非 IDE UA 返回 code 12403），
+// 而在企业个人模型接口：
+//   GET {chat_base}/console/enterprises/personal/models   国内版
+//   GET {chat_base}/v2/enterprises/personal/models        国际版优先
+// 该接口要求官方客户端指纹头（X-CodeBuddy-Request / X-Requested-With / Origin
+// / Referer / WorkBuddy UA），否则会被风控拦掉。
+//
+// 返回信封 `{code, msg, data:{agents[], models[]}}`：
+//   * `agents[name=="cli"].models` 才是网关（CLI）真正暴露的模型 id 列表；
+//   * `models[]` 带显示名、上下文、输出上限、推理档位、多模态能力。
+const CODEBUDDY_MODELS_PATH_CN: &str = "/console/enterprises/personal/models";
+const CODEBUDDY_MODELS_PATH_GLOBAL: &str = "/v2/enterprises/personal/models";
+const CODEBUDDY_CLIENT_VERSION: &str = "5.5.4";
+const CODEBUDDY_CLI_VERSION: &str = "2.137.1";
+const CODEBUDDY_MODELS_TIMEOUT: Duration = Duration::from_secs(25);
+
+fn codebuddy_origin(platform: CodebuddyLocalAccessPlatform) -> &'static str {
+    match platform {
+        CodebuddyLocalAccessPlatform::Codebuddy => "https://www.workbuddy.ai",
+        _ => "https://www.codebuddy.cn",
+    }
+}
+
+/// Headers that make the request look like the official desktop client.
+/// Verified live against `copilot.tencent.com` — without them the gateway
+/// answers `code 12403 check ua`.
+fn codebuddy_client_headers(
+    platform: CodebuddyLocalAccessPlatform,
+    access_token: &str,
+) -> Vec<(&'static str, String)> {
+    let origin = codebuddy_origin(platform);
+    let ua = format!(
+        "WorkBuddy/{v} WorkBuddy/{v} CLI/{cli}",
+        v = CODEBUDDY_CLIENT_VERSION,
+        cli = CODEBUDDY_CLI_VERSION
+    );
+    let language = match platform {
+        CodebuddyLocalAccessPlatform::Codebuddy => "en-US",
+        _ => "zh-CN",
+    };
+    vec![
+        ("Content-Type", "application/json".to_string()),
+        ("Accept", "application/json".to_string()),
+        ("Accept-Language", language.to_string()),
+        ("X-Requested-With", "XMLHttpRequest".to_string()),
+        ("X-CodeBuddy-Request", "1".to_string()),
+        ("User-Agent", ua),
+        ("Origin", origin.to_string()),
+        ("Referer", format!("{}/", origin)),
+        ("X-Agent-Purpose", "conversation".to_string()),
+        ("X-IDE-Name", "WorkBuddy".to_string()),
+        ("X-IDE-Type", "WorkBuddy".to_string()),
+        ("X-IDE-Version", CODEBUDDY_CLIENT_VERSION.to_string()),
+        ("X-Product", "WorkBuddy".to_string()),
+        ("Authorization", format!("Bearer {}", access_token)),
+    ]
+}
+
+fn codebuddy_model_paths(platform: CodebuddyLocalAccessPlatform) -> [&'static str; 2] {
+    match platform {
+        CodebuddyLocalAccessPlatform::Codebuddy => {
+            [CODEBUDDY_MODELS_PATH_GLOBAL, CODEBUDDY_MODELS_PATH_CN]
+        }
+        _ => [CODEBUDDY_MODELS_PATH_CN, CODEBUDDY_MODELS_PATH_GLOBAL],
+    }
+}
+
+/// Non-chat models must be filtered out: selecting one makes the upstream
+/// answer `code 11102`. Mirrors the upstream `nonChatModel` rules.
+fn is_non_chat_model(id: &str, max_output_tokens: i64, tags: &[String]) -> bool {
+    let lowered = id.trim().to_ascii_lowercase();
+    if ["nes-", "completion-", "codewise-"]
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+    {
+        return true;
+    }
+    if max_output_tokens > 0 && max_output_tokens <= 256 {
+        return true;
+    }
+    tags.iter().any(|tag| tag == "text-to-image")
+}
+
+fn parse_codebuddy_models(payload: &Value) -> Result<(Vec<String>, Vec<CodebuddyModelInfo>), String> {
+    let code = payload.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code != 0 {
+        let message = payload
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("模型接口返回非 0")
+            .to_string();
+        return Err(format!("code={} {}", code, message));
+    }
+    let data = payload
+        .get("data")
+        .ok_or_else(|| "模型接口缺少 data".to_string())?;
+
+    // `cli` agent 暴露的模型才是网关可用的。
+    let cli_ids: Vec<String> = data
+        .get("agents")
+        .and_then(Value::as_array)
+        .and_then(|agents| {
+            agents.iter().find_map(|agent| {
+                if agent.get("name").and_then(Value::as_str) == Some("cli") {
+                    agent.get("models").and_then(Value::as_array).map(|ids| {
+                        ids.iter()
+                            .filter_map(|id| id.as_str())
+                            .map(|id| id.trim().to_string())
+                            .filter(|id| !id.is_empty())
+                            .collect()
+                    })
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default();
+
+    let mut infos: Vec<CodebuddyModelInfo> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in data
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = raw
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if id.is_empty() || !seen.insert(id.clone()) {
+            continue;
+        }
+        if raw.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let max_output = raw
+            .get("maxOutputTokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let tags: Vec<String> = raw
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|tag| tag.as_str())
+                    .map(|tag| tag.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if is_non_chat_model(&id, max_output, &tags) {
+            continue;
+        }
+        let reasoning = raw.get("reasoning");
+        let efforts: Vec<String> = reasoning
+            .and_then(|value| value.get("supportedEfforts"))
+            .and_then(Value::as_array)
+            .map(|efforts| {
+                efforts
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(|value| value.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let description = raw
+            .get("descriptionZh")
+            .and_then(Value::as_str)
+            .or_else(|| raw.get("descriptionEn").and_then(Value::as_str))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        infos.push(CodebuddyModelInfo {
+            cli: cli_ids.iter().any(|candidate| candidate == &id),
+            id,
+            name: raw
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            context_length: raw
+                .get("maxInputTokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            max_output_tokens: max_output,
+            supports_images: raw
+                .get("supportsImages")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            supports_reasoning: raw
+                .get("supportsReasoning")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            supports_tool_call: raw
+                .get("supportsToolCall")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            efforts,
+            description,
+        });
+    }
+
+    // 展示顺序：cli 顺序优先，其余按上游顺序跟在后面。
+    let mut ordered: Vec<CodebuddyModelInfo> = Vec::new();
+    for id in &cli_ids {
+        if let Some(position) = infos.iter().position(|info| &info.id == id) {
+            ordered.push(infos.remove(position));
+        }
+    }
+    ordered.append(&mut infos);
+    Ok((cli_ids, ordered))
+}
+
+async fn fetch_models_for_account(
+    client: &reqwest::Client,
+    entry: &CodebuddyLocalAccessAccountRef,
+) -> Result<Vec<CodebuddyModelInfo>, String> {
+    let resolved = resolve_account(entry.platform, &entry.account_id)?;
+    let base = entry.platform.default_base_url().trim_end_matches('/');
+    let headers = codebuddy_client_headers(entry.platform, &resolved.access_token);
+    let mut last_error = String::from("模型接口无响应");
+    for path in codebuddy_model_paths(entry.platform) {
+        let mut request = client.get(format!("{}{}", base, path));
+        for (name, value) in &headers {
+            request = request.header(*name, value);
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("请求失败: {}", error);
+                continue;
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let payload: Value = match serde_json::from_str(&body) {
+            Ok(payload) => payload,
+            Err(_) => {
+                last_error = format!("HTTP {} 响应无法解析", status.as_u16());
+                continue;
+            }
+        };
+        match parse_codebuddy_models(&payload) {
+            Ok((_, models)) if !models.is_empty() => return Ok(models),
+            Ok(_) => last_error = "模型接口未返回任何可用模型".to_string(),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+/// 拉取所选账号可用的真实模型列表（并集，cli 顺序优先）。
+pub async fn fetch_models() -> CodebuddyFetchModelsResult {
+    let collection = load_collection();
+    if collection.accounts.is_empty() {
+        return CodebuddyFetchModelsResult {
+            ok: false,
+            message: "请先勾选至少一个账号".to_string(),
+            models: Vec::new(),
+            accounts: Vec::new(),
+        };
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(CODEBUDDY_MODELS_TIMEOUT)
+        .connect_timeout(Duration::from_secs(6))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return CodebuddyFetchModelsResult {
+                ok: false,
+                message: format!("创建请求客户端失败: {}", error),
+                models: Vec::new(),
+                accounts: Vec::new(),
+            }
+        }
+    };
+
+    let mut merged: Vec<CodebuddyModelInfo> = Vec::new();
+    let mut accounts = Vec::new();
+    for entry in &collection.accounts {
+        let label = entry
+            .label
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| entry.account_id.clone());
+        match fetch_models_for_account(&client, entry).await {
+            Ok(models) => {
+                let count = models.len();
+                for model in models {
+                    match merged.iter_mut().find(|existing| existing.id == model.id) {
+                        Some(existing) => existing.cli = existing.cli || model.cli,
+                        None => merged.push(model),
+                    }
+                }
+                accounts.push(CodebuddyFetchModelsAccountResult {
+                    account_id: entry.account_id.clone(),
+                    platform: entry.platform,
+                    label,
+                    ok: true,
+                    message: format!("拉取到 {} 个模型", count),
+                    count,
+                });
+            }
+            Err(error) => accounts.push(CodebuddyFetchModelsAccountResult {
+                account_id: entry.account_id.clone(),
+                platform: entry.platform,
+                label,
+                ok: false,
+                message: error,
+                count: 0,
+            }),
+        }
+    }
+
+    // cli 模型排前面，保持上游顺序。
+    let (mut cli, mut rest): (Vec<_>, Vec<_>) = merged.drain(..).partition(|model| model.cli);
+    cli.append(&mut rest);
+    let ok = !cli.is_empty() || !rest.is_empty();
+    let failed = accounts.iter().filter(|account| !account.ok).count();
+    let message = if !ok {
+        format!("拉取失败（{} 个账号）", failed)
+    } else if failed > 0 {
+        format!("部分账号拉取失败（{}/{}）", failed, accounts.len())
+    } else {
+        format!("拉取到 {} 个可用模型", cli.len() + rest.len())
+    };
+    CodebuddyFetchModelsResult {
+        ok,
+        message,
+        models: cli.into_iter().chain(rest).collect(),
+        accounts,
+    }
+}
+
+/// 经本地服务发起一次真实对话，验证「模型 + 账号」端到端是否可用。
+pub async fn probe_chat(model: String, prompt: Option<String>) -> CodebuddyProbeResult {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return CodebuddyProbeResult {
+            ok: false,
+            model,
+            status: None,
+            message: "请先选择要探测的模型".to_string(),
+            latency_ms: None,
+            content: None,
+            reasoning: None,
+            total_tokens: None,
+        };
+    }
+    let collection = load_collection();
+    let base_url = {
+        let runtime = runtime().lock().await;
+        if !runtime.running {
+            None
+        } else {
+            runtime.base_url()
+        }
+    };
+    let Some(base_url) = base_url else {
+        return CodebuddyProbeResult {
+            ok: false,
+            model,
+            status: None,
+            message: "服务未运行，请先启动服务".to_string(),
+            latency_ms: None,
+            content: None,
+            reasoning: None,
+            total_tokens: None,
+        };
+    };
+
+    let content = prompt
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "请只回复两个字：你好".to_string());
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": content }],
+        "stream": false,
+        "max_tokens": 128,
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return CodebuddyProbeResult {
+                ok: false,
+                model,
+                status: None,
+                message: format!("创建测试客户端失败: {}", error),
+                latency_ms: None,
+                content: None,
+                reasoning: None,
+                total_tokens: None,
+            }
+        }
+    };
+
+    let started = Instant::now();
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .bearer_auth(collection.api_key.trim())
+        .json(&body)
+        .send()
+        .await;
+    let latency = started.elapsed().as_millis() as u64;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            return CodebuddyProbeResult {
+                ok: false,
+                model,
+                status: None,
+                message: format!("请求失败: {}", error),
+                latency_ms: Some(latency),
+                content: None,
+                reasoning: None,
+                total_tokens: None,
+            }
+        }
+    };
+    let status = response.status();
+    let raw = response.text().await.unwrap_or_default();
+    let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+
+    if !status.is_success() {
+        let message = payload
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| format!("服务返回 HTTP {}", status.as_u16()));
+        return CodebuddyProbeResult {
+            ok: false,
+            model,
+            status: Some(status.as_u16()),
+            message,
+            latency_ms: Some(latency),
+            content: None,
+            reasoning: None,
+            total_tokens: None,
+        };
+    }
+
+    let choice = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first());
+    let message = choice.and_then(|choice| choice.get("message"));
+    let reply = message
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let reasoning = message
+        .and_then(|message| message.get("reasoning_content"))
+        .and_then(Value::as_str)
+        .map(|value| truncate(value.trim(), 2000))
+        .filter(|value| !value.is_empty());
+    let total_tokens = payload
+        .get("usage")
+        .and_then(|usage| usage.get("total_tokens"))
+        .and_then(Value::as_i64);
+
+    CodebuddyProbeResult {
+        ok: true,
+        model,
+        status: Some(status.as_u16()),
+        message: format!("模型响应正常 · {}ms", latency),
+        latency_ms: Some(latency),
+        content: Some(truncate(&reply, 2000)),
+        reasoning,
+        total_tokens,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::codebuddy_local_access::CodebuddyLocalAccessAccountRef;
+
+    fn build_account_ref(
+        platform: CodebuddyLocalAccessPlatform,
+        account_id: &str,
+        label: Option<String>,
+    ) -> CodebuddyLocalAccessAccountRef {
+        CodebuddyLocalAccessAccountRef {
+            platform,
+            account_id: account_id.trim().to_string(),
+            label: label.filter(|value| !value.trim().is_empty()),
+        }
+    }
+
+    #[test]
+    fn default_collection_is_disabled_and_portable() {
+        let collection = CodebuddyLocalAccessCollection::default();
+        assert!(!collection.enabled);
+        assert!(collection.port > 0);
+        assert!(collection.accounts.is_empty());
+    }
+
+    #[test]
+    fn normalize_collection_generates_api_key_and_dedupes_accounts() {
+        let mut collection = CodebuddyLocalAccessCollection::default();
+        collection.accounts = vec![
+            build_account_ref(CodebuddyLocalAccessPlatform::Workbuddy, "a1", None),
+            build_account_ref(CodebuddyLocalAccessPlatform::Workbuddy, " a1 ", None),
+            build_account_ref(CodebuddyLocalAccessPlatform::CodebuddyCn, "a1", None),
+        ];
+        collection.model_ids = vec![" glm-5.1 ".to_string(), "GLM-5.1".to_string()];
+        normalize_collection(&mut collection);
+
+        assert!(collection.api_key.starts_with("cbk-"));
+        assert_eq!(collection.accounts.len(), 2);
+        assert_eq!(collection.model_ids, vec!["glm-5.1".to_string()]);
+    }
+
+    #[test]
+    fn jwt_exp_is_decoded_in_milliseconds() {
+        // {"exp":1789030679} base64url payload
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"exp":1789030679}"#);
+        let token = format!("header.{}.signature", payload);
+        assert_eq!(jwt_exp_ms(&token), Some(1789030679000));
+        assert_eq!(jwt_exp_ms("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn build_manifest_requires_at_least_one_account() {
+        let mut collection = CodebuddyLocalAccessCollection::default();
+        normalize_collection(&mut collection);
+        let error = build_manifest(&collection).expect_err("empty selection must fail");
+        assert!(error.contains("至少选择一个"));
+    }
+
+    #[test]
+    fn sidecar_config_binds_loopback_for_localhost_scope() {
+        let mut collection = CodebuddyLocalAccessCollection::default();
+        normalize_collection(&mut collection);
+        let config = sidecar_config(&collection, Path::new("/tmp/auths"));
+        assert_eq!(config["host"], LOCALHOST_BIND_HOST);
+        assert_eq!(config["port"], json!(collection.port));
+
+        collection.access_scope = CodebuddyLocalAccessScope::Lan;
+        let config = sidecar_config(&collection, Path::new("/tmp/auths"));
+        assert_eq!(config["host"], LAN_BIND_HOST);
+    }
+
+    #[test]
+    fn current_model_ids_falls_back_to_preset() {
+        let mut collection = CodebuddyLocalAccessCollection::default();
+        assert_eq!(
+            current_model_ids(&collection).len(),
+            CODEBUDDY_DEFAULT_MODEL_IDS.len()
+        );
+        collection.model_ids = vec!["custom-model".to_string()];
+        assert_eq!(
+            current_model_ids(&collection),
+            vec!["custom-model".to_string()]
+        );
+    }
+}

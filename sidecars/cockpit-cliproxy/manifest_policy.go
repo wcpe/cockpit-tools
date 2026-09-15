@@ -84,6 +84,22 @@ const defaultCodexAlphaSearchURL = "https://chatgpt.com/backend-api/codex/alpha/
 const maxCodexAlphaSearchRequestBytes = 16 << 20
 const maxCodexAlphaSearchResponseBytes = 32 << 20
 
+// CodeBuddy / WorkBuddy reverse-proxy wire constants. Verified against
+// copilot.tencent.com: the upstream rejects non-streaming chat requests, so the
+// relay always streams upstream and synthesizes a JSON body for clients that
+// asked for `stream: false`.
+const (
+	codebuddyUpstreamKind        = "codebuddy"
+	codebuddyDefaultBaseURL      = "https://copilot.tencent.com"
+	codebuddyChatCompletionsPath = "/v2/chat/completions"
+	codebuddyTokenRefreshPath    = "/v2/plugin/auth/token/refresh"
+	codebuddyDefaultAgentIntent  = "craft"
+	codebuddyContentType         = "application/json;charset=UTF-8"
+	// The gateway validates User-Agent and rejects unknown clients.
+	codebuddyDefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+		"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
 var (
 	streamOpenTimeout      = 10 * time.Second
 	streamOpenMaxAttempts  = 2
@@ -114,9 +130,11 @@ type manifest struct {
 	// MaxAccountConcurrency 限制单个账号同时处理的会话数；0 表示不限制。
 	MaxAccountConcurrency int `json:"maxAccountConcurrency"`
 	// AccountConcurrencyWaitMs 账号并发达到上限后的等待时长（毫秒）；0 表示不等待，直接拒绝。
-	AccountConcurrencyWaitMs int   `json:"accountConcurrencyWaitMs"`
-	DebugLogs                *bool `json:"debugLogs,omitempty"`
+	AccountConcurrencyWaitMs int                     `json:"accountConcurrencyWaitMs"`
+	DebugLogs                *bool                   `json:"debugLogs,omitempty"`
+	CodebuddyUpstreams       []codebuddyUpstreamSpec `json:"codebuddyUpstreams,omitempty"`
 
+	codebuddyByID     map[string]*codebuddyUpstreamSpec
 	apiKeyByValue     map[string]*apiKeySpec
 	accountByID       map[string]*accountSpec
 	accountByAuthID   map[string]*accountSpec
@@ -133,6 +151,7 @@ type apiKeySpec struct {
 	ID              string               `json:"id"`
 	Label           string               `json:"label"`
 	Key             string               `json:"key"`
+	UpstreamKind    string               `json:"upstreamKind,omitempty"`
 	ProviderGateway *providerGatewaySpec `json:"providerGateway,omitempty"`
 	ModelRouting    *modelRoutingSpec    `json:"modelRouting,omitempty"`
 	BoundOAuth      bool                 `json:"boundOAuth,omitempty"`
@@ -362,6 +381,29 @@ type providerGatewaySpec struct {
 
 type providerGatewayModelCapability struct {
 	SupportsVision bool `json:"supportsVision,omitempty"`
+}
+
+// codebuddyUpstreamSpec describes one CodeBuddy / CodeBuddy CN / WorkBuddy
+// subscription account that the relay can serve through the CodeBuddy wire
+// protocol (`POST {baseUrl}/v2/chat/completions`).
+//
+// The access token is an OAuth/Keycloak JWT; Rust remains the token authority
+// and rematerializes the manifest when it refreshes a token. The sidecar only
+// refreshes opportunistically when the upstream answers 401 so a long-running
+// proxy keeps working between manifest rewrites.
+type codebuddyUpstreamSpec struct {
+	ID               string   `json:"id"`
+	Label            string   `json:"label,omitempty"`
+	Platform         string   `json:"platform,omitempty"`
+	BaseURL          string   `json:"baseUrl"`
+	AccessToken      string   `json:"accessToken"`
+	RefreshToken     string   `json:"refreshToken,omitempty"`
+	UserAgent        string   `json:"userAgent,omitempty"`
+	AgentIntent      string   `json:"agentIntent,omitempty"`
+	ModelIDs         []string `json:"modelIds,omitempty"`
+	IncludeReasoning bool     `json:"includeReasoning,omitempty"`
+	Disabled         bool     `json:"disabled,omitempty"`
+	ExpiresAtMS      *int64   `json:"expiresAtMs,omitempty"`
 }
 
 type accountSpec struct {
@@ -985,6 +1027,7 @@ func loadManifest(path string) (*manifest, error) {
 		}
 		m.APIKeys[i].Key = key
 		m.APIKeys[i].ImageGenerationAccountIDs = normalizeStringList(m.APIKeys[i].ImageGenerationAccountIDs)
+		m.APIKeys[i].UpstreamKind = normalizeUpstreamKind(m.APIKeys[i].UpstreamKind)
 		if gateway := m.APIKeys[i].ProviderGateway; gateway != nil {
 			if !normalizeProviderGatewaySpec(gateway) {
 				m.APIKeys[i].ProviderGateway = nil
@@ -1039,6 +1082,16 @@ func loadManifest(path string) (*manifest, error) {
 			}
 		}
 		m.apiKeyByValue[key] = &m.APIKeys[i]
+	}
+	m.codebuddyByID = make(map[string]*codebuddyUpstreamSpec)
+	for i := range m.CodebuddyUpstreams {
+		upstream := &m.CodebuddyUpstreams[i]
+		upstream.ID = strings.TrimSpace(upstream.ID)
+		if upstream.ID == "" {
+			continue
+		}
+		normalizeCodebuddyUpstream(upstream)
+		m.codebuddyByID[upstream.ID] = upstream
 	}
 	m.accountByID = make(map[string]*accountSpec)
 	m.accountByAuthID = make(map[string]*accountSpec)
@@ -1138,6 +1191,39 @@ func isConfiguredImagesToolModel(m *manifest, model string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeUpstreamKind(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case codebuddyUpstreamKind, "codebuddy_cn", "codebuddy-cn", "workbuddy":
+		return codebuddyUpstreamKind
+	default:
+		return ""
+	}
+}
+
+// normalizeCodebuddyUpstream trims and defaults one upstream entry in place.
+// An entry without an access token stays in the manifest but is skipped by
+// model discovery and account selection so a partially refreshed account does
+// not break the whole service.
+func normalizeCodebuddyUpstream(upstream *codebuddyUpstreamSpec) {
+	if upstream == nil {
+		return
+	}
+	upstream.Label = strings.TrimSpace(upstream.Label)
+	upstream.Platform = strings.ToLower(strings.TrimSpace(upstream.Platform))
+	upstream.BaseURL = strings.Trim(strings.TrimSpace(upstream.BaseURL), "/")
+	if upstream.BaseURL == "" {
+		upstream.BaseURL = codebuddyDefaultBaseURL
+	}
+	upstream.AccessToken = strings.TrimSpace(upstream.AccessToken)
+	upstream.RefreshToken = strings.TrimSpace(upstream.RefreshToken)
+	upstream.UserAgent = strings.TrimSpace(upstream.UserAgent)
+	if upstream.UserAgent == "" {
+		upstream.UserAgent = codebuddyDefaultUserAgent
+	}
+	upstream.AgentIntent = strings.TrimSpace(upstream.AgentIntent)
+	upstream.ModelIDs = normalizeStringList(upstream.ModelIDs)
 }
 
 func normalizeProviderGatewaySpec(gateway *providerGatewaySpec) bool {
@@ -1344,6 +1430,11 @@ func (p *requestPolicy) middleware() gin.HandlerFunc {
 		}
 
 		if spec != nil && isModelsRequest(c.Request) {
+			if isCodebuddyAPIKey(spec) {
+				c.JSON(http.StatusOK, codebuddyModelsResponse(codebuddyCatalogForAPIKey(p.manifest, spec)))
+				c.Abort()
+				return
+			}
 			models := clientCatalogModelsForAPIKey(p.manifest, spec)
 			if isCodexClientModelsRequest(c.Request) {
 				response := buildCodexClientModelsResponse(models, spec, contextWindowsForAPIKey(p.manifest, spec), p.manifest)
@@ -2413,6 +2504,15 @@ func rewriteBodyModel(m *manifest, spec *apiKeySpec, requestKind string, body []
 		}
 		// Preserve client aliases for candidate lookup; canonicalization belongs
 		// to the selected native executor or provider route.
+		return nil, model, nil
+	}
+
+	if isCodebuddyAPIKey(spec) {
+		// CodeBuddy clients send the upstream model id verbatim; there is no
+		// catalog canonicalization step and no Codex-specific visibility list.
+		if catalog := codebuddyCatalogForAPIKey(m, spec); len(catalog) > 0 && !stringSliceContainsFold(catalog, model) {
+			return nil, model, fmt.Errorf("模型 %s 不在当前 API Key 的可用模型范围内", model)
+		}
 		return nil, model, nil
 	}
 	if _, _, status := resolveModelRouting(spec, model); status != "none" {

@@ -608,6 +608,10 @@ func (s *relayServer) handleModels(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if isCodebuddyAPIKey(spec) {
+		s.handleCodebuddyModels(c, spec)
+		return
+	}
 	models := clientCatalogModelsForAPIKey(s.manifest, spec)
 	if isCodexClientModelsRequest(c.Request) {
 		c.JSON(http.StatusOK, buildCodexClientModelsResponse(models, spec, contextWindowsForAPIKey(s.manifest, spec), s.manifest))
