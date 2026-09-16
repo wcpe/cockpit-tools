@@ -16,6 +16,9 @@ import {
   XCircle,
   Globe,
   FileText,
+  Gift,
+  Smartphone,
+  GraduationCap,
   Zap,
   Trash2,
 } from 'lucide-react';
@@ -32,9 +35,13 @@ import {
 import {
   getWorkbuddyActivityOverviewAll,
   getWorkbuddyActivitySchedule,
+  getWorkbuddyActivityCachedRuns,
+  refreshWorkbuddyActivityAccount,
+  refreshWorkbuddyActivityAllSlow,
   runWorkbuddyActivityCatTravel,
   runWorkbuddyActivityDailyAll,
   runWorkbuddyActivityGrowth,
+  runWorkbuddyActivityKind,
   runWorkbuddyActivityKindAll,
   runWorkbuddyActivityNightCat,
   runWorkbuddyActivityReport,
@@ -51,6 +58,9 @@ const TAB_ICONS: Record<WorkbuddyActivityCenterTab, typeof Sparkles> = {
   cat: Cat,
   nightCat: Moon,
   activityReport: Activity,
+  streakRewards: Gift,
+  schoolSeason: GraduationCap,
+  miniprogram: Smartphone,
   schedule: Clock,
   logs: FileText,
 };
@@ -76,6 +86,12 @@ function resolveRun(
       return runWorkbuddyActivityNightCat(accountId);
     case 'activityReport':
       return runWorkbuddyActivityReport(accountId);
+    case 'streakRewards':
+      return runWorkbuddyActivityKind('streakRewards', accountId);
+    case 'schoolSeason':
+      return runWorkbuddyActivityKind('schoolSeason', accountId);
+    case 'miniprogram':
+      return runWorkbuddyActivityKind('miniprogram', accountId);
     default:
       return Promise.reject(new Error(`unsupported tab: ${tab}`));
   }
@@ -108,6 +124,7 @@ export function WorkbuddyActivityCenterModal({
   const [activeTab, setActiveTab] = useState<WorkbuddyActivityCenterTab>('growth');
   const [overview, setOverview] = useState<Record<string, WorkbuddyActivityOverview>>({});
   const [runningId, setRunningId] = useState<string | null>(null);
+  const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [runLogs, setRunLogs] = useState<Record<string, WorkbuddyActivityRunLog>>({});
   const [schedule, setSchedule] = useState<WorkbuddyActivityScheduleStatus | null>(null);
   const [scheduleSaving, setScheduleSaving] = useState(false);
@@ -129,6 +146,7 @@ export function WorkbuddyActivityCenterModal({
     }
   }, []);
 
+  /** 打开界面：优先读缓存，不强制打接口。 */
   const loadOverview = useCallback(async (force = false) => {
     setOverviewLoading(true);
     try {
@@ -137,7 +155,7 @@ export function WorkbuddyActivityCenterModal({
       for (const item of result.items) {
         next[item.accountId] = item.overview;
       }
-      setOverview(next);
+      setOverview((prev) => (force ? next : { ...prev, ...next }));
       setCacheInfo({
         count: result.cacheAccountCount,
         newestAt: result.cacheNewestAt,
@@ -149,9 +167,72 @@ export function WorkbuddyActivityCenterModal({
     }
   }, []);
 
+  /** 回填上次执行结果，避免重开界面看起来“空了”。 */
+  const loadCachedRuns = useCallback(async () => {
+    try {
+      const cached = await getWorkbuddyActivityCachedRuns();
+      const next: Record<string, WorkbuddyActivityRunLog> = {};
+      for (const item of cached) {
+        // 同账号保留最近一条（list 已按时间倒序，后写覆盖先写时跳过已有）
+        if (!next[item.log.accountId]) {
+          next[item.log.accountId] = item.log;
+        }
+      }
+      setRunLogs((prev) => ({ ...next, ...prev }));
+    } catch (err) {
+      console.warn('[WorkbuddyActivity] 读执行结果缓存失败', err);
+    }
+  }, []);
+
+  /** 单账号强制刷新总览。 */
+  const refreshOneAccount = useCallback(
+    async (accountId: string) => {
+      if (refreshingId) return;
+      setRefreshingId(accountId);
+      try {
+        const overview = await refreshWorkbuddyActivityAccount(accountId);
+        setOverview((prev) => ({ ...prev, [accountId]: overview }));
+      } catch (err) {
+        console.warn('[WorkbuddyActivity] 单号刷新失败', err);
+      } finally {
+        setRefreshingId(null);
+      }
+    },
+    [refreshingId],
+  );
+
+  /** 全账号慢刷：账号间隔约 1.5s，显示进度。 */
+  const refreshAllSlow = useCallback(async () => {
+    if (overviewLoading || batchRunning) return;
+    setOverviewLoading(true);
+    setBatchProgress(t('workbuddy.activity.slowRefreshStart', '全量慢刷中…'));
+    try {
+      const result = await refreshWorkbuddyActivityAllSlow();
+      const next: Record<string, WorkbuddyActivityOverview> = {};
+      for (const item of result.items) {
+        next[item.accountId] = item.overview;
+      }
+      setOverview(next);
+      setCacheInfo({
+        count: result.cacheAccountCount,
+        newestAt: result.cacheNewestAt,
+      });
+      setBatchProgress(
+        t('workbuddy.activity.slowRefreshDone', '慢刷完成 · {{count}} 账号', {
+          count: result.items.length,
+        }),
+      );
+    } catch (err) {
+      setBatchProgress(err instanceof Error ? err.message : String(err));
+    } finally {
+      setOverviewLoading(false);
+    }
+  }, [overviewLoading, batchRunning, t]);
+
   useEffect(() => {
     void loadSchedule();
-    void loadOverview();
+    void loadOverview(false);
+    void loadCachedRuns();
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen(WORKBUDDY_ACTIVITY_SCHEDULE_CHANGED_EVENT, () => {
@@ -166,7 +247,7 @@ export function WorkbuddyActivityCenterModal({
       disposed = true;
       unlisten?.();
     };
-  }, [loadSchedule, loadOverview]);
+  }, [loadSchedule, loadOverview, loadCachedRuns]);
 
   const activeMeta = useMemo(
     () => WORKBUDDY_ACTIVITY_CENTER_TABS.find((item) => item.id === activeTab)!,
@@ -179,8 +260,17 @@ export function WorkbuddyActivityCenterModal({
     try {
       const result = await resolveRun(activeTab, accountId);
       setRunLogs((prev) => ({ ...prev, [accountId]: result }));
-      if (activeTab === 'growth' || activeTab === 'cat' || activeTab === 'nightCat') {
-        void loadOverview(true);
+      if (
+        activeTab === 'growth' ||
+        activeTab === 'cat' ||
+        activeTab === 'nightCat' ||
+        activeTab === 'streakRewards' ||
+        activeTab === 'schoolSeason' ||
+        activeTab === 'miniprogram' ||
+        activeTab === 'activityReport'
+      ) {
+        // 只刷新该账号，避免全量再打一轮
+        void refreshOneAccount(accountId);
       }
     } catch (err) {
       setRunLogs((prev) => ({
@@ -208,6 +298,12 @@ export function WorkbuddyActivityCenterModal({
         return 'nightCat' as const;
       case 'activityReport':
         return 'activityReport' as const;
+      case 'streakRewards':
+        return 'streakRewards' as const;
+      case 'schoolSeason':
+        return 'schoolSeason' as const;
+      case 'miniprogram':
+        return 'miniprogram' as const;
       default:
         return null;
     }
@@ -235,7 +331,8 @@ export function WorkbuddyActivityCenterModal({
           { ok: okCount, total: results.length, earned },
         ),
       );
-      void loadOverview(true);
+      // 后端已失效缓存；这里只读缓存补齐未命中账号，不再 force 全量
+      void loadOverview(false);
     } catch (err) {
       setBatchProgress(err instanceof Error ? err.message : String(err));
     } finally {
@@ -265,7 +362,7 @@ export function WorkbuddyActivityCenterModal({
           { ok: okCount, earned },
         ),
       );
-      void loadOverview(true);
+      void loadOverview(false);
     } catch (err) {
       setBatchProgress(err instanceof Error ? err.message : String(err));
     } finally {
@@ -276,7 +373,9 @@ export function WorkbuddyActivityCenterModal({
   const handleClearCache = async () => {
     try {
       await clearWorkbuddyActivityOverviewCache();
-      await loadOverview(true);
+      setOverview({});
+      setCacheInfo({ count: 0, newestAt: null });
+      setBatchProgress(t('workbuddy.activity.cacheCleared', '缓存已清空，可用慢刷重新拉取'));
     } catch (err) {
       console.warn(err);
     }
@@ -337,7 +436,7 @@ export function WorkbuddyActivityCenterModal({
         </div>
 
         <div className="checkin-modal-toolbar">
-          <div className="auto-checkin-tabs-nav" style={{ flexWrap: 'wrap', gap: 6 }}>
+          <div className="auto-checkin-tabs-nav" style={{ flexWrap: 'wrap', gap: 4 }}>
             {WORKBUDDY_ACTIVITY_CENTER_TABS.map((item) => {
               const TabIcon = TAB_ICONS[item.id];
               return (
@@ -345,13 +444,32 @@ export function WorkbuddyActivityCenterModal({
                   key={item.id}
                   className={`auto-checkin-tab-item ${activeTab === item.id ? 'active' : ''}`}
                   onClick={() => setActiveTab(item.id)}
+                  title={t(item.descKey, item.descDefault)}
                 >
-                  <TabIcon size={14} />
+                  <TabIcon size={13} />
                   {t(item.titleKey, item.titleDefault)}
                 </button>
               );
             })}
           </div>
+          {activeMeta && activeTab !== 'logs' && activeTab !== 'schedule' ? (
+            <div
+              style={{
+                marginTop: 8,
+                fontSize: 12,
+                opacity: 0.75,
+                display: 'flex',
+                gap: 12,
+                flexWrap: 'wrap',
+                alignItems: 'center',
+              }}
+            >
+              <span>{t(activeMeta.descKey, activeMeta.descDefault)}</span>
+              {activeMeta.hours !== '—' ? (
+                <span style={{ opacity: 0.8 }}>({activeMeta.hours})</span>
+              ) : null}
+            </div>
+          ) : null}
         </div>
 
         <div className="modal-body" style={{ maxHeight: '60vh', overflowY: 'auto' }}>
@@ -375,18 +493,21 @@ export function WorkbuddyActivityCenterModal({
                 <button
                   className="btn btn-secondary icon-only"
                   onClick={() => void loadOverview(false)}
-                  title={t('workbuddy.activity.useCache', '读缓存刷新')}
+                  title={t('workbuddy.activity.useCache', '读缓存（不打接口）')}
                   disabled={overviewLoading}
                 >
                   <RefreshCw size={14} className={overviewLoading ? 'loading-spinner' : ''} />
                 </button>
                 <button
                   className="btn btn-secondary icon-only"
-                  onClick={() => void loadOverview(true)}
-                  title={t('workbuddy.activity.forceRefresh', '强制拉取状态')}
-                  disabled={overviewLoading}
+                  onClick={() => void refreshAllSlow()}
+                  title={t(
+                    'workbuddy.activity.slowRefresh',
+                    '全量慢刷（账号间隔约 1.5s，防风控）',
+                  )}
+                  disabled={overviewLoading || batchRunning}
                 >
-                  <Zap size={14} />
+                  <Zap size={14} className={overviewLoading ? 'loading-spinner' : ''} />
                 </button>
                 <button
                   className="btn btn-secondary icon-only"
@@ -423,7 +544,10 @@ export function WorkbuddyActivityCenterModal({
                   className="btn btn-primary"
                   disabled={batchRunning}
                   onClick={() => void runDailyAll()}
-                  title={t('workbuddy.activity.dailyAllHint', '依次对全部国内版账号执行签到/猫猫/上报/成长')}
+                  title={t(
+                    'workbuddy.activity.dailyAllHint',
+                    '依次对全部国内版账号执行签到/猫猫/上报/成长（含连登奖励）',
+                  )}
                 >
                   {batchRunning ? (
                     <Loader2 size={14} className="loading-spinner" />
@@ -491,18 +615,31 @@ export function WorkbuddyActivityCenterModal({
                             </div>
                           </div>
                           {cn && (
-                            <button
-                              className="btn btn-primary"
-                              disabled={runningId === account.id}
-                              onClick={() => void runAccount(account.id)}
-                            >
-                              {runningId === account.id ? (
-                                <Loader2 size={14} className="loading-spinner" />
-                              ) : (
-                                <Play size={14} />
-                              )}
-                              {t('workbuddy.activity.runNow', '立即执行')}
-                            </button>
+                            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                              <button
+                                className="btn btn-secondary icon-only"
+                                disabled={refreshingId === account.id || runningId === account.id}
+                                onClick={() => void refreshOneAccount(account.id)}
+                                title={t('workbuddy.activity.refreshOne', '刷新该账号状态')}
+                              >
+                                <RefreshCw
+                                  size={14}
+                                  className={refreshingId === account.id ? 'loading-spinner' : ''}
+                                />
+                              </button>
+                              <button
+                                className="btn btn-primary"
+                                disabled={runningId === account.id}
+                                onClick={() => void runAccount(account.id)}
+                              >
+                                {runningId === account.id ? (
+                                  <Loader2 size={14} className="loading-spinner" />
+                                ) : (
+                                  <Play size={14} />
+                                )}
+                                {t('workbuddy.activity.runNow', '立即执行')}
+                              </button>
+                            </div>
                           )}
                         </div>
                         {cn && activeTab === 'growth' && info?.tasks?.length ? (
@@ -530,6 +667,24 @@ export function WorkbuddyActivityCenterModal({
                                 {task.name} · {task.status}
                               </span>
                             ))}
+                          </div>
+                        ) : null}
+                        {cn && (activeTab === 'streakRewards' || activeTab === 'schoolSeason' || activeTab === 'miniprogram') ? (
+                          <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>
+                            {activeTab === 'streakRewards'
+                              ? t(
+                                  'workbuddy.activity.streakRewardsHint',
+                                  '今日已处理过则自动跳过（按天幂等）；礼包/补偿/补签/兑换/抽奖一次跑完',
+                                )
+                              : activeTab === 'schoolSeason'
+                                ? t(
+                                    'workbuddy.activity.schoolSeasonHint',
+                                    '需账号可访问开学季活动；未开放或已完成会静默跳过',
+                                  )
+                                : t(
+                                    'workbuddy.activity.miniprogramHint',
+                                    '小程序限定成长任务，缺任务清单时提示未开放',
+                                  )}
                           </div>
                         ) : null}
                         {log?.logs?.length ? (
@@ -569,7 +724,7 @@ export function WorkbuddyActivityCenterModal({
                   <span className="label-desc">
                     {t(
                       'workbuddy.activity.scheduleMasterDesc',
-                      '按官方默认整点自动执行六类任务；国际版仅 Token 保活',
+                      '按官方默认整点自动执行签到/猫猫/上报/开学季/夜猫/保活；国际版仅 Token 保活',
                     )}
                   </span>
                 </div>

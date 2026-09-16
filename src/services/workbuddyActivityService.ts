@@ -3,6 +3,7 @@ import type {
   WorkbuddyActivityLogEntry,
   WorkbuddyActivityOverview,
   WorkbuddyActivityOverviewAllResult,
+  WorkbuddyActivityRunKind,
   WorkbuddyActivityRunLog,
   WorkbuddyActivityScheduleKind,
   WorkbuddyActivityScheduleStatus,
@@ -23,8 +24,36 @@ export async function getWorkbuddyActivityOverviewAll(
   });
 }
 
+/** 单账号强制刷新总览。 */
+export async function refreshWorkbuddyActivityAccount(
+  accountId: string,
+): Promise<WorkbuddyActivityOverview> {
+  return await invoke<WorkbuddyActivityOverview>('workbuddy_activity_refresh_account', {
+    accountId,
+  });
+}
+
+/** 全账号慢刷总览（账号间隔约 1.5s）。 */
+export async function refreshWorkbuddyActivityAllSlow(): Promise<WorkbuddyActivityOverviewAllResult> {
+  return await invoke<WorkbuddyActivityOverviewAllResult>('workbuddy_activity_refresh_all_slow');
+}
+
+/** 上次执行结果缓存（可选按 kind 过滤）。 */
+export interface WorkbuddyCachedRunLog {
+  log: WorkbuddyActivityRunLog;
+  kind: string;
+  ranAt: string;
+  ranAtTs: number;
+}
+
+export async function getWorkbuddyActivityCachedRuns(
+  kind?: string,
+): Promise<WorkbuddyCachedRunLog[]> {
+  return await invoke<WorkbuddyCachedRunLog[]>('workbuddy_activity_get_cached_runs', { kind });
+}
+
 export async function runWorkbuddyActivityKindAll(
-  kind: WorkbuddyActivityScheduleKind | 'growth' | 'checkin' | 'catTravel' | 'nightCat' | 'activityReport',
+  kind: WorkbuddyActivityRunKind,
 ): Promise<WorkbuddyActivityRunLog[]> {
   return await invoke<WorkbuddyActivityRunLog[]>('workbuddy_activity_run_kind_all', { kind });
 }
@@ -64,6 +93,17 @@ export async function runWorkbuddyActivityReport(
   accountId: string,
 ): Promise<WorkbuddyActivityRunLog> {
   return await invoke<WorkbuddyActivityRunLog>('workbuddy_activity_run_activity_report', {
+    accountId,
+  });
+}
+
+/** 按 kind 执行单个账号（streakRewards / schoolSeason / miniprogram 等）。 */
+export async function runWorkbuddyActivityKind(
+  kind: string,
+  accountId: string,
+): Promise<WorkbuddyActivityRunLog> {
+  return await invoke<WorkbuddyActivityRunLog>('workbuddy_activity_run_kind', {
+    kind,
     accountId,
   });
 }

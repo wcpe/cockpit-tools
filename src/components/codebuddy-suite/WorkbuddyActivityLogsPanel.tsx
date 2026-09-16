@@ -18,10 +18,14 @@ type ViewTab = 'activity' | 'checkin';
 const KIND_OPTIONS: Array<{ value: KindFilter; labelKey: string; label: string }> = [
   { value: '', labelKey: 'common.all', label: '全部' },
   { value: 'checkin', labelKey: 'workbuddy.activity.kindCheckin', label: '每日签到' },
-  { value: 'growth', labelKey: 'workbuddy.activity.kindSchool', label: '成长任务' },
+  { value: 'growth', labelKey: 'workbuddy.activity.kindSchool', label: '成长/开学季/小程序' },
   { value: 'catTravel', labelKey: 'workbuddy.activity.kindCat', label: '猫猫旅行' },
   { value: 'nightCat', labelKey: 'workbuddy.activity.kindNight', label: '夜猫子' },
-  { value: 'activityReport', labelKey: 'workbuddy.activity.kindReport', label: '活跃上报' },
+  {
+    value: 'activityReport',
+    labelKey: 'workbuddy.activity.kindReport',
+    label: '活跃上报/连登奖励',
+  },
   { value: 'tokenKeepalive', labelKey: 'workbuddy.activity.kindKeepalive', label: 'Token 保活' },
 ];
 

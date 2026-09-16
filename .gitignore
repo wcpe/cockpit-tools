@@ -53,3 +53,4 @@ docs/plugin-architecture-proposal.md
 .qoder/
 
 sidecars/mihomo/bin/
+/.workbuddy/
