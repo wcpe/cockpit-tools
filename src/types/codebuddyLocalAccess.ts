@@ -29,6 +29,8 @@ export interface CodebuddyLocalAccessAccountOption {
   selected: boolean;
   tokenAvailable: boolean;
   expiresAtMs?: number | null;
+  creditsRemain?: number | null;
+  creditsSize?: number | null;
 }
 
 export interface CodebuddyLocalAccessState {
@@ -98,4 +100,81 @@ export interface CodebuddyProbeResult {
   content?: string | null;
   reasoning?: string | null;
   totalTokens?: number | null;
+}
+
+export interface CodebuddyRequestRecord {
+  id: string;
+  timestamp: string;
+  timestampUnixMs?: number | null;
+  accountId?: string | null;
+  accountLabel?: string | null;
+  model: string;
+  clientStream?: boolean;
+  outcome: string;
+  httpStatus?: number | null;
+  latencyMs?: number | null;
+  message?: string | null;
+  reasonCode?: string | null;
+  resetAt?: string | null;
+  conversationRequestId?: string | null;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  totalTokens?: number | null;
+  credit?: number | null;
+  hasCredit?: boolean;
+  maxTokens?: number | null;
+  temperature?: number | null;
+  topP?: number | null;
+  messageCount?: number | null;
+  systemChars?: number | null;
+  toolCount?: number | null;
+  toolChoice?: string | null;
+  finishReason?: string | null;
+  attempt?: number | null;
+  degradedPrompt?: boolean;
+  promptMode?: string | null;
+  includeReasoning?: boolean;
+  cachedTokens?: number | null;
+  cacheWriteTokens?: number | null;
+  reasoningTokens?: number | null;
+  upstreamStream?: boolean;
+  firstTokenMs?: number | null;
+  totalMs?: number | null;
+}
+
+export interface CodebuddyRateLimitedModel {
+  id?: string;
+  accountId?: string;
+  accountLabel?: string;
+  model: string;
+  until?: string | null;
+  resetAt?: string | null;
+  reason?: string | null;
+}
+
+export interface CodebuddyModelUsageRow {
+  model: string;
+  requests: number;
+  inputTokens: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalInput: number;
+  outputTokens: number;
+  cacheHitPct: number;
+  totalTokens: number;
+  credit?: number | null;
+  lastAt?: string | null;
+}
+
+export interface CodebuddyRuntimeStatus {
+  promptMode?: string;
+  rateLimitedModels?: CodebuddyRateLimitedModel[];
+  recentRequests?: CodebuddyRequestRecord[];
+  requestStats?: Record<
+    string,
+    { accountId: string; model: string; ok: number; fail: number; credit?: number }
+  >;
+  modelUsage?: CodebuddyModelUsageRow[];
+  sessionAffinityCount?: number;
+  accounts?: Array<Record<string, unknown>>;
 }

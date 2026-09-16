@@ -4,7 +4,10 @@ import type {
   CodebuddyLocalAccessSavePayload,
   CodebuddyLocalAccessState,
   CodebuddyLocalAccessTestResult,
+  CodebuddyModelUsageRow,
   CodebuddyProbeResult,
+  CodebuddyRequestRecord,
+  CodebuddyRuntimeStatus,
 } from "../types/codebuddyLocalAccess";
 
 export async function getCodebuddyLocalAccessState(): Promise<CodebuddyLocalAccessState> {
@@ -54,4 +57,23 @@ export async function probeCodebuddyChat(
   prompt?: string,
 ): Promise<CodebuddyProbeResult> {
   return await invoke("codebuddy_local_access_probe_chat", { model, prompt: prompt ?? null });
+}
+
+/** 从运行中的 sidecar 拉取冷却台账与请求流水。 */
+export async function getCodebuddyRuntimeStatus(): Promise<CodebuddyRuntimeStatus> {
+  return await invoke("codebuddy_local_access_runtime_status");
+}
+
+/** 分页拉取请求流水（offset/limit）。 */
+export async function getCodebuddyRuntimeRequests(
+  offset = 0,
+  limit = 20,
+): Promise<{
+  total: number;
+  offset: number;
+  limit: number;
+  records: CodebuddyRequestRecord[];
+  modelUsage?: CodebuddyModelUsageRow[];
+}> {
+  return await invoke("codebuddy_local_access_runtime_requests", { offset, limit });
 }
