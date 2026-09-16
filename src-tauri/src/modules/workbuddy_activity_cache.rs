@@ -1,6 +1,10 @@
-//! WorkBuddy 活动总览状态缓存。
+//! WorkBuddy 活动中心本地缓存。
 //!
-//! 避免活动中心每次打开都对全部账号打一轮接口。默认 TTL 5 分钟，
+//! 避免活动中心每次打开都对全部账号打一轮接口：
+//! * **总览缓存**：每账号一份 `ActivityOverview`，默认 TTL 5 分钟。
+//! * **执行结果缓存**：每账号 × 活动 kind 一份上次 `ActivityRunLog`，
+//!   重开界面直接回填，不必重跑。
+//!
 //! 文件：`workbuddy_activity_overview_cache.json`。
 
 use std::collections::HashMap;
@@ -11,10 +15,14 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::{DateTime, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 
-use crate::modules::{atomic_write, config, workbuddy_activity::ActivityOverview};
+use crate::modules::{
+    atomic_write, config,
+    workbuddy_activity::{ActivityOverview, ActivityRunLog},
+};
 
 const DEFAULT_TTL_SECS: i64 = 300;
 const MAX_CACHED_ACCOUNTS: usize = 200;
+const MAX_CACHED_RUNS: usize = 500;
 
 static STORAGE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -26,11 +34,27 @@ pub struct CachedOverview {
     pub fetched_at_ts: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedRunLog {
+    pub log: ActivityRunLog,
+    pub kind: String,
+    pub ran_at: String,
+    pub ran_at_ts: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct OverviewCacheStore {
     #[serde(default)]
     entries: HashMap<String, CachedOverview>,
+    /// key = `{account_id}::{kind}`
+    #[serde(default)]
+    runs: HashMap<String, CachedRunLog>,
+}
+
+fn run_key(account_id: &str, kind: &str) -> String {
+    format!("{}::{}", account_id, kind)
 }
 
 fn cache_path() -> PathBuf {
@@ -81,6 +105,18 @@ pub fn get_cached_overview(
         .map(|entry| entry.overview.clone()))
 }
 
+/// 读缓存（忽略 TTL）。用于「先展示旧数据，后台再慢刷」。
+pub fn get_cached_overview_stale(
+    account_id: &str,
+) -> Result<Option<(ActivityOverview, i64)>, String> {
+    let _guard = lock_storage()?;
+    let store = read_store()?;
+    Ok(store
+        .entries
+        .get(account_id)
+        .map(|entry| (entry.overview.clone(), entry.fetched_at_ts)))
+}
+
 pub fn put_overview(account_id: &str, overview: ActivityOverview) -> Result<(), String> {
     let _guard = lock_storage()?;
     let mut store = read_store()?;
@@ -109,7 +145,79 @@ pub fn put_overview(account_id: &str, overview: ActivityOverview) -> Result<(), 
     write_store(&store)
 }
 
+/// 记录某账号某活动的执行结果（重开界面回填用）。
+pub fn put_run_log(account_id: &str, kind: &str, log: ActivityRunLog) -> Result<(), String> {
+    let _guard = lock_storage()?;
+    let mut store = read_store()?;
+    let now = Local::now();
+    store.runs.insert(
+        run_key(account_id, kind),
+        CachedRunLog {
+            log,
+            kind: kind.to_string(),
+            ran_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ran_at_ts: now.timestamp(),
+        },
+    );
+    if store.runs.len() > MAX_CACHED_RUNS {
+        let mut pairs: Vec<(String, i64)> = store
+            .runs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.ran_at_ts))
+            .collect();
+        pairs.sort_by_key(|(_, ts)| *ts);
+        let drop_count = store.runs.len() - MAX_CACHED_RUNS;
+        for (key, _) in pairs.into_iter().take(drop_count) {
+            store.runs.remove(&key);
+        }
+    }
+    write_store(&store)
+}
+
+/// 读某账号某活动的上次执行结果。
+pub fn get_run_log(account_id: &str, kind: &str) -> Result<Option<ActivityRunLog>, String> {
+    let _guard = lock_storage()?;
+    let store = read_store()?;
+    Ok(store.runs.get(&run_key(account_id, kind)).map(|c| c.log.clone()))
+}
+
+/// 读全部上次执行结果（按 kind 过滤，None=全部）。
+pub fn list_run_logs(kind: Option<&str>) -> Result<Vec<CachedRunLog>, String> {
+    let _guard = lock_storage()?;
+    let store = read_store()?;
+    let mut out: Vec<CachedRunLog> = store
+        .runs
+        .values()
+        .filter(|c| kind.map(|k| c.kind == k).unwrap_or(true))
+        .cloned()
+        .collect();
+    out.sort_by_key(|c| std::cmp::Reverse(c.ran_at_ts));
+    Ok(out)
+}
+
 pub fn invalidate_account(account_id: &str) -> Result<(), String> {
+    let _guard = lock_storage()?;
+    let mut store = read_store()?;
+    let mut changed = store.entries.remove(account_id).is_some();
+    let prefix = format!("{}::", account_id);
+    let keys: Vec<String> = store
+        .runs
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for key in keys {
+        store.runs.remove(&key);
+        changed = true;
+    }
+    if changed {
+        write_store(&store)?;
+    }
+    Ok(())
+}
+
+/// 仅失效总览（保留执行结果日志回填）。
+pub fn invalidate_overview_only(account_id: &str) -> Result<(), String> {
     let _guard = lock_storage()?;
     let mut store = read_store()?;
     if store.entries.remove(account_id).is_some() {
@@ -138,6 +246,7 @@ pub fn cache_snapshot() -> Result<CacheSnapshot, String> {
     }
     Ok(CacheSnapshot {
         account_count: store.entries.len(),
+        run_log_count: store.runs.len(),
         newest_fetched_at: newest.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()),
         now_ts: now,
         default_ttl_secs: DEFAULT_TTL_SECS,
@@ -148,6 +257,7 @@ pub fn cache_snapshot() -> Result<CacheSnapshot, String> {
 #[serde(rename_all = "camelCase")]
 pub struct CacheSnapshot {
     pub account_count: usize,
+    pub run_log_count: usize,
     pub newest_fetched_at: Option<String>,
     pub now_ts: i64,
     pub default_ttl_secs: i64,

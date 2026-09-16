@@ -153,6 +153,30 @@ pub async fn workbuddy_activity_run_task(
     Ok(result)
 }
 
+/// 按 kind 执行单个账号（streakRewards / schoolSeason / miniprogram 等）。
+#[tauri::command]
+pub async fn workbuddy_activity_run_kind(
+    kind: String,
+    account_id: String,
+) -> Result<ActivityRunLog, String> {
+    let result = workbuddy_activity::run_kind_for_account(&kind, &account_id).await?;
+    let log_kind = match kind.as_str() {
+        "growth" | "schoolSeason" | "school" | "miniprogram" | "minichat" => {
+            ActivityLogKind::Growth
+        }
+        "streakRewards" | "streak" | "activityReport" | "activity_report" => {
+            ActivityLogKind::ActivityReport
+        }
+        "catTravel" | "cat" => ActivityLogKind::CatTravel,
+        "nightCat" => ActivityLogKind::NightCat,
+        "checkin" => ActivityLogKind::Checkin,
+        _ => ActivityLogKind::Growth,
+    };
+    log_manual_run(log_kind, &result);
+    let _ = crate::modules::workbuddy_activity_cache::invalidate_account(&result.account_id);
+    Ok(result)
+}
+
 #[tauri::command]
 pub fn workbuddy_activity_get_schedule() -> Result<WorkbuddyActivityScheduleStatus, String> {
     workbuddy_scheduler::get_schedule_status()
@@ -256,6 +280,7 @@ pub async fn workbuddy_activity_overview_all(
     let snapshot = crate::modules::workbuddy_activity_cache::cache_snapshot().unwrap_or_else(|_| {
         crate::modules::workbuddy_activity_cache::CacheSnapshot {
             account_count: 0,
+            run_log_count: 0,
             newest_fetched_at: None,
             now_ts: 0,
             default_ttl_secs: 300,
@@ -274,13 +299,68 @@ pub async fn workbuddy_activity_overview_all(
     })
 }
 
+/// 单账号强制刷新总览。
+#[tauri::command]
+pub async fn workbuddy_activity_refresh_account(
+    account_id: String,
+) -> Result<ActivityOverview, String> {
+    workbuddy_activity::refresh_overview_account(&account_id).await
+}
+
+/// 全账号慢刷总览：账号间隔约 1.5s，通过事件回报进度。
+#[tauri::command]
+pub async fn workbuddy_activity_refresh_all_slow(
+    app: tauri::AppHandle,
+) -> Result<ActivityOverviewAllResult, String> {
+    use tauri::Emitter;
+    let gap = std::time::Duration::from_millis(1500);
+    let pairs = workbuddy_activity::refresh_overview_all_slow(gap, |done, total, account_id| {
+        let _ = app.emit(
+            "workbuddy-activity-refresh-progress",
+            serde_json::json!({ "done": done, "total": total, "accountId": account_id }),
+        );
+    })
+    .await?;
+    let snapshot = crate::modules::workbuddy_activity_cache::cache_snapshot().unwrap_or_else(|_| {
+        crate::modules::workbuddy_activity_cache::CacheSnapshot {
+            account_count: 0,
+            run_log_count: 0,
+            newest_fetched_at: None,
+            now_ts: 0,
+            default_ttl_secs: 300,
+        }
+    });
+    Ok(ActivityOverviewAllResult {
+        items: pairs
+            .into_iter()
+            .map(|(account_id, overview)| ActivityOverviewItem {
+                account_id,
+                overview,
+            })
+            .collect(),
+        cache_account_count: snapshot.account_count,
+        cache_newest_at: snapshot.newest_fetched_at,
+    })
+}
+
+/// 读上次执行结果缓存（可选按 kind 过滤）。
+#[tauri::command]
+pub fn workbuddy_activity_get_cached_runs(
+    kind: Option<String>,
+) -> Result<Vec<crate::modules::workbuddy_activity_cache::CachedRunLog>, String> {
+    crate::modules::workbuddy_activity_cache::list_run_logs(kind.as_deref())
+}
+
 /// 全账号批量执行某一类活动。
 #[tauri::command]
 pub async fn workbuddy_activity_run_kind_all(
     kind: String,
 ) -> Result<Vec<ActivityRunLog>, String> {
     let log_kind = match kind.as_str() {
-        "growth" | "schoolSeason" => ActivityLogKind::Growth,
+        "growth" => ActivityLogKind::Growth,
+        "schoolSeason" | "school" => ActivityLogKind::Growth,
+        "miniprogram" | "minichat" => ActivityLogKind::Growth,
+        "streakRewards" | "streak" => ActivityLogKind::ActivityReport,
         "catTravel" | "cat" => ActivityLogKind::CatTravel,
         "nightCat" => ActivityLogKind::NightCat,
         "activityReport" | "activity_report" => ActivityLogKind::ActivityReport,

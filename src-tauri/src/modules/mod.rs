@@ -146,6 +146,7 @@ pub mod workbuddy_instance;
 pub mod workbuddy_activity;
 pub mod workbuddy_activity_cache;
 pub mod workbuddy_activity_log;
+pub mod workbuddy_activity_waf;
 pub mod workbuddy_oauth;
 pub mod workbuddy_scheduler;
 pub mod workbuddy_session_transfer;

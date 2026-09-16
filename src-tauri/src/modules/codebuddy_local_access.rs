@@ -173,6 +173,7 @@ fn jwt_exp_ms(token: &str) -> Option<i64> {
 
 struct ResolvedAccount {
     label: String,
+    uid: Option<String>,
     access_token: String,
     refresh_token: Option<String>,
     expires_at_ms: Option<i64>,
@@ -188,6 +189,7 @@ fn resolve_account(
             let account = workbuddy_account::load_account(account_id).ok_or_else(missing)?;
             ResolvedAccount {
                 label: account.email.clone(),
+                uid: account.uid.clone(),
                 access_token: account.access_token,
                 refresh_token: account.refresh_token,
                 expires_at_ms: account.expires_at,
@@ -197,6 +199,7 @@ fn resolve_account(
             let account = codebuddy_cn_account::load_account(account_id).ok_or_else(missing)?;
             ResolvedAccount {
                 label: account.email.clone(),
+                uid: account.uid.clone(),
                 access_token: account.access_token,
                 refresh_token: account.refresh_token,
                 expires_at_ms: account.expires_at,
@@ -206,6 +209,7 @@ fn resolve_account(
             let account = codebuddy_account::load_account(account_id).ok_or_else(missing)?;
             ResolvedAccount {
                 label: account.email.clone(),
+                uid: account.uid.clone(),
                 access_token: account.access_token,
                 refresh_token: account.refresh_token,
                 expires_at_ms: account.expires_at,
@@ -317,6 +321,7 @@ fn build_manifest(collection: &CodebuddyLocalAccessCollection) -> Result<Value, 
         let resolved = resolve_account(entry.platform, &entry.account_id)?;
         upstreams.push(json!({
             "id": entry.account_id,
+            "uid": resolved.uid,
             "label": entry
                 .label
                 .clone()
@@ -606,6 +611,74 @@ pub fn stop_service_on_shutdown() {
     }
 }
 
+fn quota_credits_from_raw(quota_raw: Option<&serde_json::Value>) -> (Option<i64>, Option<i64>) {
+    let Some(raw) = quota_raw else {
+        return (None, None);
+    };
+    let mut remain_total = 0i64;
+    let mut size_total = 0i64;
+    let mut found = false;
+    let mut walk = |node: &serde_json::Value| {
+        let obj = match node {
+            serde_json::Value::Object(map) => map,
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    // Recurse into arrays.
+                    if item.is_object() {
+                        if let Some(map) = item.as_object() {
+                            let _ = map;
+                        }
+                    }
+                }
+                return;
+            }
+            _ => return,
+        };
+        let remain = obj
+            .get("CycleCapacityRemainPrecise")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .or_else(|| {
+                obj.get("CycleCapacityRemain")
+                    .and_then(serde_json::Value::as_i64)
+            });
+        let size = obj
+            .get("CycleCapacitySize")
+            .and_then(serde_json::Value::as_i64);
+        if remain.is_some() || size.is_some() {
+            found = true;
+            remain_total += remain.unwrap_or(0);
+            size_total += size.unwrap_or(0);
+        }
+    };
+    // Flatten: walk common container shapes.
+    fn collect_objects(node: &serde_json::Value, out: &mut Vec<serde_json::Map<String, serde_json::Value>>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                out.push(map.clone());
+                for value in map.values() {
+                    collect_objects(value, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_objects(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut objects = Vec::new();
+    collect_objects(raw, &mut objects);
+    for obj in objects {
+        walk(&serde_json::Value::Object(obj));
+    }
+    if !found {
+        return (None, None);
+    }
+    (Some(remain_total.max(0)), Some(size_total.max(0)))
+}
+
 fn account_options(
     collection: &CodebuddyLocalAccessCollection,
 ) -> Vec<CodebuddyLocalAccessAccountOption> {
@@ -625,7 +698,9 @@ fn account_options(
                     account_id: String,
                     label: String,
                     token: String,
-                    expires_at: Option<i64>| {
+                    expires_at: Option<i64>,
+                    credits_remain: Option<i64>,
+                    credits_size: Option<i64>| {
         let token = token.trim().to_string();
         let expires_at_ms = expires_at
             .filter(|value| *value > 0)
@@ -638,34 +713,45 @@ fn account_options(
             selected: selected.contains(&(platform.as_str().to_string(), account_id)),
             token_available: !token.is_empty(),
             expires_at_ms,
+            credits_remain,
+            credits_size,
         });
     };
 
     for account in workbuddy_account::list_accounts() {
+        let (remain, size) = quota_credits_from_raw(account.quota_raw.as_ref());
         push(
             CodebuddyLocalAccessPlatform::Workbuddy,
             account.id.clone(),
             account.email.clone(),
             account.access_token.clone(),
             account.expires_at,
+            remain,
+            size,
         );
     }
     for account in codebuddy_cn_account::list_accounts() {
+        let (remain, size) = quota_credits_from_raw(account.quota_raw.as_ref());
         push(
             CodebuddyLocalAccessPlatform::CodebuddyCn,
             account.id.clone(),
             account.email.clone(),
             account.access_token.clone(),
             account.expires_at,
+            remain,
+            size,
         );
     }
     for account in codebuddy_account::list_accounts() {
+        let (remain, size) = quota_credits_from_raw(account.quota_raw.as_ref());
         push(
             CodebuddyLocalAccessPlatform::Codebuddy,
             account.id.clone(),
             account.email.clone(),
             account.access_token.clone(),
             account.expires_at,
+            remain,
+            size,
         );
     }
     options
@@ -711,6 +797,83 @@ pub async fn service_state() -> CodebuddyLocalAccessState {
         lan_base_url,
         last_error,
     }
+}
+
+/// Fetch governance + request ledger from the running sidecar (`/v1/codebuddy/status`).
+pub async fn fetch_runtime_status() -> Result<
+    crate::models::codebuddy_local_access::CodebuddyRuntimeStatus,
+    String,
+> {
+    use crate::models::codebuddy_local_access::CodebuddyRuntimeStatus;
+    let base_url = {
+        let runtime = runtime().lock().await;
+        if !runtime.running {
+            None
+        } else {
+            runtime.base_url()
+        }
+    };
+    let Some(base_url) = base_url else {
+        return Err("服务未运行，请先启动服务".to_string());
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let resp = client
+        .get(format!("{}/v1/codebuddy/status", base_url))
+        .send()
+        .await
+        .map_err(|e| format!("请求运行状态失败: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("运行状态接口返回 {}", resp.status()));
+    }
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析运行状态失败: {}", e))?;
+    let mut status: CodebuddyRuntimeStatus = serde_json::from_value(value.clone())
+        .map_err(|e| format!("运行状态结构不兼容: {}", e))?;
+    status.raw = Some(value);
+    Ok(status)
+}
+
+/// Fetch a page of request-log records from `/v1/codebuddy/requests`.
+pub async fn fetch_runtime_requests(
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let base_url = {
+        let runtime = runtime().lock().await;
+        if !runtime.running {
+            None
+        } else {
+            runtime.base_url()
+        }
+    };
+    let Some(base_url) = base_url else {
+        return Err("服务未运行，请先启动服务".to_string());
+    };
+    let offset = offset.unwrap_or(0).min(500);
+    let limit = limit.unwrap_or(20).clamp(1, 100);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let resp = client
+        .get(format!(
+            "{}/v1/codebuddy/requests?offset={}&limit={}",
+            base_url, offset, limit
+        ))
+        .send()
+        .await
+        .map_err(|e| format!("请求流水接口失败: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("请求流水接口返回 {}", resp.status()));
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("解析请求流水失败: {}", e))
 }
 
 /// Probe the running service. Uses `/v1/models` so the check never spends

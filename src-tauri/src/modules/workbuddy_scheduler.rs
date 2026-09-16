@@ -521,7 +521,7 @@ async fn execute_kind(kind: ScheduleKind) -> (bool, String, Vec<ActivityRunLog>)
                         }
                     }
                     ScheduleKind::SchoolSeason => {
-                        match workbuddy_activity::run_growth_tasks_for_account(&account.id).await {
+                        match workbuddy_activity::run_school_season_for_account(&account.id).await {
                             Ok(log) => log,
                             Err(err) => ActivityRunLog {
                                 ok: false,

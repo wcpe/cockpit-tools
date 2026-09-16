@@ -17,7 +17,7 @@ use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::modules::{logger, workbuddy_account};
+use crate::modules::{logger, workbuddy_account, workbuddy_activity_waf};
 use crate::models::workbuddy::WorkbuddyAccount;
 
 // ── 域名与 UA ─────────────────────────────────────────────────
@@ -387,11 +387,70 @@ pub fn build_event(uid: &str, kind: &str, idx: usize) -> Value {
                 "userId": uid
             })
         }
+        "buddy_first" => json!({
+            "eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
+            "mode": "craft", "conversationId": cid, "requestId": rid, "inputLength": 12,
+            "requestModelId": "deepseek-v4-flash", "requestModelName": "DeepSeek V4 Flash",
+            "isPlan": false, "agentName": "default", "agentType": "conversation",
+            "userId": uid
+        }),
         _ => json!({ "eventCode": "heartbeat", "timestamp": now, "userId": uid }),
     }
 }
 
 // ── 客户端 ────────────────────────────────────────────────────
+/// 活动请求错误：区分 WAF 拦截与普通失败，驱动软冷却。
+#[derive(Debug, Clone)]
+pub enum ActivityError {
+    /// 403 无业务信封（APISIX WAF）。
+    Waf {
+        retry_after: Option<Duration>,
+        message: String,
+    },
+    Other(String),
+}
+
+impl std::fmt::Display for ActivityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Waf { message, .. } => write!(f, "WAF 拦截: {}", message),
+            Self::Other(message) => write!(f, "{}", message),
+        }
+    }
+}
+
+impl From<String> for ActivityError {
+    fn from(value: String) -> Self {
+        Self::Other(value)
+    }
+}
+
+impl From<ActivityError> for String {
+    fn from(value: ActivityError) -> Self {
+        value.to_string()
+    }
+}
+
+/// SPA 同款 client_token：`<prefix>-<32hex uuid v4>`。每次写调用必须新键。
+fn growth_client_token(prefix: &str) -> String {
+    format!("{}-{}", prefix, uuid::Uuid::new_v4().simple())
+}
+
+/// CST（Asia/Shanghai）自然日，固定 +8，不依赖容器 tzdata。
+fn cst_now() -> chrono::DateTime<chrono::FixedOffset> {
+    chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+}
+
+fn cst_yesterday() -> String {
+    (cst_now() - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+fn cst_today() -> String {
+    cst_now().format("%Y-%m-%d").to_string()
+}
+
 pub struct ActivityClient {
     client: reqwest::Client,
 }
@@ -406,21 +465,63 @@ impl ActivityClient {
             .map_err(|error| format!("创建活动请求客户端失败: {}", error))
     }
 
-    async fn get(&self, account: &WorkbuddyAccount, url: &str) -> Result<Value, String> {
+    /// 发送请求并解析；403 无业务信封 → WAF 错误（驱动软冷却）。
+    async fn send(
+        &self,
+        account: &WorkbuddyAccount,
+        request: reqwest::RequestBuilder,
+    ) -> Result<(u16, Value, reqwest::header::HeaderMap), ActivityError> {
+        let account_id = account.id.clone();
+        if let Some(remaining) = workbuddy_activity_waf::gate().remaining(&account_id) {
+            return Err(ActivityError::Waf {
+                retry_after: Some(remaining),
+                message: format!(
+                    "账号 WAF 冷却中，剩余 {}s",
+                    remaining.as_secs().max(1)
+                ),
+            });
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| ActivityError::Other(format!("请求失败: {}", error)))?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        if workbuddy_activity_waf::is_waf_blocked(status, &body) {
+            let retry_after = workbuddy_activity_waf::parse_retry_after(&headers);
+            workbuddy_activity_waf::gate().note_block(&account_id, retry_after);
+            logger::log_warn(&format!(
+                "[WorkbuddyActivity] WAF 403 account={} retry_after={:?}",
+                account_id, retry_after
+            ));
+            return Err(ActivityError::Waf {
+                retry_after,
+                message: truncate(&body, 120),
+            });
+        }
+        workbuddy_activity_waf::gate().note_ok(&account_id);
+        let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        Ok((status, payload, headers))
+    }
+
+    async fn get(
+        &self,
+        account: &WorkbuddyAccount,
+        url: &str,
+    ) -> Result<Value, ActivityError> {
         let realm = resolve_realm(account.domain.as_deref());
         let mut request = self.client.get(url);
         for (name, value) in outbound_headers(account, realm) {
             request = request.header(name, value);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| format!("请求失败: {}", error))?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let payload: Value = serde_json::from_str(&body).map_err(|_| {
-            format!("响应无法解析 (HTTP {}): {}", status.as_u16(), truncate(&body, 200))
-        })?;
+        let (status, payload, _) = self.send(account, request).await?;
+        if payload.is_null() {
+            return Err(ActivityError::Other(format!(
+                "响应无法解析 (HTTP {})",
+                status
+            )));
+        }
         Ok(payload)
     }
 
@@ -429,7 +530,7 @@ impl ActivityClient {
         account: &WorkbuddyAccount,
         url: &str,
         body: Option<Value>,
-    ) -> Result<(u16, Value), String> {
+    ) -> Result<(u16, Value), ActivityError> {
         let realm = resolve_realm(account.domain.as_deref());
         let mut request = self.client.post(url);
         for (name, value) in outbound_headers(account, realm) {
@@ -438,14 +539,28 @@ impl ActivityClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| format!("请求失败: {}", error))?;
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let (status, payload, _) = self.send(account, request).await?;
         Ok((status, payload))
+    }
+
+    /// 带小程序平台头的请求构造（开学季 / Sequential_Tasks_1）。
+    fn apply_mp_header(
+        &self,
+        account: &WorkbuddyAccount,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<Value>,
+    ) -> reqwest::RequestBuilder {
+        let realm = resolve_realm(account.domain.as_deref());
+        let mut request = self.client.request(method, url);
+        for (name, value) in outbound_headers(account, realm) {
+            request = request.header(name, value);
+        }
+        request = request.header("X-Client-Platform", "miniprogram");
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        request
     }
 
     /// 成长任务清单。
@@ -647,6 +762,793 @@ impl ActivityClient {
         })
     }
 
+    // ── 连登奖励 / 抽奖 / 补签 / 礼包 ─────────────────────────
+    /// 连登天数 + 兑换状态（GET /activity/growth/streak）。
+    pub async fn growth_reward_state(
+        &self,
+        account: &WorkbuddyAccount,
+    ) -> Result<(i64, Value), String> {
+        let realm = resolve_realm(account.domain.as_deref());
+        let url = format!("{}/activity/growth/streak", realm.chat_base());
+        let payload = self.get(account, &url).await?;
+        let data = payload.get("data").cloned().unwrap_or(Value::Null);
+        let days = data
+            .get("streak")
+            .and_then(|s| s.get("days"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let redemption = data
+            .get("redemption_status")
+            .cloned()
+            .unwrap_or(Value::Null);
+        Ok((days, redemption))
+    }
+
+    /// 挑最高达标未领档位（对齐 growthEligibleTier）。返回 "" = 无可领。
+    fn eligible_tier(days: i64, redemption: &Value) -> String {
+        let tiers = redemption
+            .get("tiers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let claimed = |tier: &str| -> bool {
+            let key = format!("tier_{}_status", tier.trim_end_matches('d'));
+            redemption
+                .get(&key)
+                .and_then(Value::as_str)
+                .map(|s| s == "claimed")
+                .unwrap_or(false)
+        };
+        for tier in ["28d", "14d", "7d"] {
+            let need = match tier {
+                "7d" => 7,
+                "14d" => 14,
+                _ => 28,
+            };
+            // 优先读接口下发的 days，缺失用常量门槛。
+            let tier_days = tiers
+                .iter()
+                .find(|t| t.get("tier").and_then(Value::as_str) == Some(tier))
+                .and_then(|t| t.get("days").and_then(Value::as_i64))
+                .unwrap_or(need);
+            if days >= tier_days && !claimed(tier) {
+                return tier.to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// 兑换连登奖励。409 duplicate / 403 天数不足为正常态（Ok(false)）。
+    pub async fn growth_redeem(
+        &self,
+        account: &WorkbuddyAccount,
+        tier: &str,
+    ) -> Result<(bool, Value), String> {
+        let realm = resolve_realm(account.domain.as_deref());
+        let url = format!("{}/activity/growth/redeem", realm.chat_base());
+        let token = growth_client_token(&format!("redeem-{}", tier));
+        let (status, payload) = self
+            .post(
+                account,
+                &url,
+                Some(json!({ "tier": tier, "client_token": token })),
+            )
+            .await?;
+        let code = payload.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if code == 0 {
+            return Ok((true, payload.get("data").cloned().unwrap_or(Value::Null)));
+        }
+        let msg = payload
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        // 正常态：已领取 / 天数不足
+        if status == 409 || status == 403 || msg.contains("duplicate") || msg.contains("已领取") || msg.contains("连续登录天数不足") {
+            return Ok((false, Value::Null));
+        }
+        Err(format!(
+            "redeem {} 失败 (HTTP {}): {}",
+            tier,
+            status,
+            payload.get("msg").and_then(Value::as_str).unwrap_or("")
+        ))
+    }
+
+    pub async fn lottery_chances(&self, account: &WorkbuddyAccount) -> Result<i64, String> {
+        let realm = resolve_realm(account.domain.as_deref());
+        let url = format!("{}/activity/growth/lottery/chances", realm.chat_base());
+        let payload = self.get(account, &url).await?;
+        Ok(payload
+            .get("data")
+            .and_then(|d| d.get("balance"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0))
+    }
+
+    /// 抽一次奖。400 无次数/未开启为正常态（Ok(false)）。
+    pub async fn lottery_draw(
+        &self,
+        account: &WorkbuddyAccount,
+    ) -> Result<(bool, Value), String> {
+        let realm = resolve_realm(account.domain.as_deref());
+        let url = format!("{}/activity/growth/lottery/draw", realm.chat_base());
+        let token = growth_client_token("draw");
+        let (status, payload) = self
+            .post(account, &url, Some(json!({ "client_token": token })))
+            .await?;
+        let code = payload.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if code == 0 {
+            return Ok((true, payload.get("data").cloned().unwrap_or(Value::Null)));
+        }
+        let msg = payload
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        if status == 400
+            && (msg.contains("insufficient") || msg.contains("lottery disabled") || msg.contains("无抽奖"))
+        {
+            return Ok((false, Value::Null));
+        }
+        Err(format!(
+            "lottery draw 失败 (HTTP {}): {}",
+            status,
+            payload.get("msg").and_then(Value::as_str).unwrap_or("")
+        ))
+    }
+
+    /// billing 域领取（新手礼包 / 活动补偿）。业务错误 → Ok(false) 静默。
+    async fn claim_billing_credit(
+        &self,
+        account: &WorkbuddyAccount,
+        path: &str,
+    ) -> Result<(bool, i64), String> {
+        let realm = resolve_realm(account.domain.as_deref());
+        let url = format!("{}{}", realm.bill_base(), path);
+        let (_, payload) = self
+            .post(account, &url, Some(json!({})))
+            .await?;
+        let code = payload.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if code == 0 {
+            let credit = payload
+                .get("data")
+                .and_then(|d| d.get("credit"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            return Ok((true, credit));
+        }
+        Ok((false, 0))
+    }
+
+    pub async fn claim_gift(&self, account: &WorkbuddyAccount) -> Result<(bool, i64), String> {
+        self.claim_billing_credit(account, "/billing/meter/claim-gift")
+            .await
+    }
+
+    pub async fn claim_compensation(
+        &self,
+        account: &WorkbuddyAccount,
+    ) -> Result<(bool, i64), String> {
+        self.claim_billing_credit(account, "/billing/meter/claim-compensation")
+            .await
+    }
+
+    pub async fn growth_heatmap(&self, account: &WorkbuddyAccount) -> Result<Vec<Value>, String> {
+        let realm = resolve_realm(account.domain.as_deref());
+        let url = format!("{}/activity/growth/heatmap", realm.chat_base());
+        let payload = self.get(account, &url).await?;
+        Ok(payload
+            .get("data")
+            .and_then(|d| d.get("cells"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// 昨日漏签且有卡时补签。返回是否成功补签。
+    async fn makeup_yesterday(&self, account: &WorkbuddyAccount) -> bool {
+        let yesterday = cst_yesterday();
+        let cells = match self.growth_heatmap(account).await {
+            Ok(cells) => cells,
+            Err(_) => return false,
+        };
+        let score_zero = cells.iter().any(|cell| {
+            let date = cell.get("date").and_then(Value::as_str).unwrap_or("");
+            let score = cell.get("score").and_then(Value::as_i64).unwrap_or(-1);
+            date.len() >= 10 && &date[..10] == yesterday && score == 0
+        });
+        if !score_zero {
+            return false;
+        }
+        // 查补签卡余额（streak 同响应体）
+        let realm = resolve_realm(account.domain.as_deref());
+        let url = format!("{}/activity/growth/streak", realm.chat_base());
+        let payload = match self.get(account, &url).await {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let balance = payload
+            .get("data")
+            .and_then(|d| d.get("makeup_cards"))
+            .and_then(|c| c.get("balance"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if balance <= 0 {
+            return false;
+        }
+        let use_url = format!("{}/activity/growth/makeup-cards/use", realm.chat_base());
+        match self
+            .post(
+                account,
+                &use_url,
+                Some(json!({ "target_date": yesterday })),
+            )
+            .await
+        {
+            Ok((_, payload))
+                if payload.get("code").and_then(Value::as_i64) == Some(0) =>
+            {
+                logger::log_info(&format!(
+                    "[WorkbuddyActivity] makeup ok account={} date={}",
+                    account.id, yesterday
+                ));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 连登闭环：礼包/补偿 → 补签 → redeem → lottery。按天幂等由调用方闸。
+    pub async fn claim_growth_rewards(
+        &self,
+        account: &WorkbuddyAccount,
+    ) -> (Vec<String>, i64) {
+        let mut logs = Vec::new();
+        let mut earned = 0i64;
+        if resolve_realm(account.domain.as_deref()) != WorkbuddyRealm::Cn {
+            return (logs, earned);
+        }
+        // 0. 礼包 / 补偿（业务错误静默）
+        if let Ok((true, credit)) = self.claim_gift(account).await {
+            if credit > 0 {
+                earned += credit;
+                logs.push(format!("✓ 新手礼包 +{} 积分", credit));
+            }
+        }
+        tokio::time::sleep(MIN_REQUEST_GAP).await;
+        if let Ok((true, credit)) = self.claim_compensation(account).await {
+            if credit > 0 {
+                earned += credit;
+                logs.push(format!("✓ 活动补偿 +{} 积分", credit));
+            }
+        }
+        tokio::time::sleep(MIN_REQUEST_GAP).await;
+
+        let mut state = match self.growth_reward_state(account).await {
+            Ok(state) => state,
+            Err(error) => {
+                logs.push(format!("连登状态查询失败: {}", error));
+                return (logs, earned);
+            }
+        };
+        // 0.5 补签保连登
+        if self.makeup_yesterday(account).await {
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+            if let Ok(fresh) = self.growth_reward_state(account).await {
+                state = fresh;
+            }
+        }
+        let (days, redemption) = &state;
+        let tier = Self::eligible_tier(*days, redemption);
+        if !tier.is_empty() {
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+            match self.growth_redeem(account, &tier).await {
+                Ok((true, data)) => {
+                    let credit = data
+                        .get("credit_granted")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let chances = data
+                        .get("chances_granted")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    earned += credit;
+                    logs.push(format!(
+                        "✓ 连登奖励 {}d 兑换成功: +{} 积分, +{} 抽奖",
+                        tier.trim_end_matches('d'),
+                        credit,
+                        chances
+                    ));
+                }
+                Ok((false, _)) => {
+                    logs.push(format!("连登 {}d 已领取或未达标", tier.trim_end_matches('d')));
+                }
+                Err(error) => logs.push(format!("连登 {}d 兑换失败: {}", tier, error)),
+            }
+            // 1.5 抽奖
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+            match self.lottery_chances(account).await {
+                Ok(chances) if chances > 0 => {
+                    tokio::time::sleep(MIN_REQUEST_GAP).await;
+                    match self.lottery_draw(account).await {
+                        Ok((true, data)) => {
+                            let prize = data
+                                .get("prize_name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("未知奖品");
+                            let credit = data
+                                .get("credit_amount")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
+                            earned += credit;
+                            logs.push(format!("✓ 连登抽奖: {} (+{})", prize, credit));
+                        }
+                        Ok((false, _)) => logs.push("连登抽奖次数耗尽或未开启".to_string()),
+                        Err(error) => logs.push(format!("连登抽奖失败: {}", error)),
+                    }
+                }
+                _ => {}
+            }
+        }
+        (logs, earned)
+    }
+
+    // ── first_buddy 领养链 ───────────────────────────────────
+    /// report 解锁 → agreement → buddy/first → claim。
+    pub async fn run_first_buddy(&self, account: &WorkbuddyAccount) -> Vec<String> {
+        let mut logs = Vec::new();
+        let uid = account.uid.clone().unwrap_or_default();
+        if uid.is_empty() {
+            logs.push("账号缺少 uid，无法领养".to_string());
+            return logs;
+        }
+        // 1) 对话事件解锁
+        let event = build_event(&uid, "buddy_first", 0);
+        let _ = self.report_events(account, &[event], true).await;
+        tokio::time::sleep(MIN_REQUEST_GAP).await;
+
+        // 2) agreement
+        let realm = resolve_realm(account.domain.as_deref());
+        let agree_url = format!("{}/v2/auth/agreement?type=adopt_buddy", realm.chat_base());
+        let ids: Vec<String> = match self.get(account, &agree_url).await {
+            Ok(payload) => payload
+                .get("data")
+                .and_then(|d| d.get("agreements"))
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(error) => {
+                logs.push(format!("查询领养协议失败: {}", error));
+                Vec::new()
+            }
+        };
+        if !ids.is_empty() {
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+            let post_url = format!("{}/v2/auth/agreement", realm.chat_base());
+            let _ = self
+                .post(
+                    account,
+                    &post_url,
+                    Some(json!({ "agree_list": ids, "disagree_list": [] })),
+                )
+                .await;
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+        }
+
+        // 3) buddy/first
+        let first_url = format!("{}/activity/growth/buddy/first", realm.chat_base());
+        match self.post(account, &first_url, None).await {
+            Ok((_, payload)) => {
+                let code = payload.get("code").and_then(Value::as_i64).unwrap_or(-1);
+                if code == 0 {
+                    logs.push("✓ 首只猫猫领养成功".to_string());
+                } else {
+                    let msg = payload
+                        .get("msg")
+                        .and_then(Value::as_str)
+                        .unwrap_or("业务错误");
+                    // already / 已领养 为正常态
+                    if msg.contains("already") || msg.contains("已领养") || msg.contains("exist") {
+                        logs.push("首只猫猫已领养".to_string());
+                    } else {
+                        logs.push(format!("领养请求: {}", msg));
+                    }
+                }
+            }
+            Err(error) => logs.push(format!("领养失败: {}", error)),
+        }
+        tokio::time::sleep(MIN_REQUEST_GAP).await;
+        // 4) claim
+        match self.claim_task(account, "first_buddy").await {
+            Ok((true, credit, _)) => {
+                logs.push(format!("✓ first_buddy 领奖 +{} 积分", credit));
+            }
+            Ok((false, _, _)) => logs.push("first_buddy 已上报，领奖稍后结算".to_string()),
+            Err(error) => logs.push(format!("first_buddy 领奖失败: {}", error)),
+        }
+        logs
+    }
+
+    // ── 小程序任务 ───────────────────────────────────────────
+    /// 小程序指纹对话事件（Sequential_Tasks_1 / school mini_chat）。
+    pub fn build_miniprogram_chat_event(uid: &str, idx: usize) -> Value {
+        let now = chrono::Utc::now().timestamp_millis();
+        let cid = format!("wb-mp-{}-{}", now, idx);
+        json!({
+            "eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
+            "source": "mini_program", "ideName": "wx_app_cloud",
+            "ideType": "WorkBuddy_MP", "extName": "workbuddy-mp",
+            "extVersion": "2.4.0", "mode": "chat",
+            "conversationId": cid, "requestId": cid, "inputLength": 12,
+            "mentionContexts": [], "mentionContextCount": 0, "userId": uid
+        })
+    }
+
+    /// 开学季事件（school 域）。
+    pub fn build_school_event(uid: &str, kind: &str, activity_id: &str, idx: usize) -> Value {
+        let now = chrono::Utc::now().timestamp_millis();
+        let cid = format!("wbs-{}-{}-{}", activity_id, now, idx);
+        let rid = format!("{}-r", cid);
+        match kind {
+            "mini_chat" => json!({
+                "eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
+                "source": "mini_program", "ideName": "wx_app_cloud",
+                "ideType": "WorkBuddy_MP", "extName": "workbuddy-mp",
+                "extVersion": "2.4.0", "mode": "chat",
+                "conversationId": cid, "requestId": cid, "inputLength": 12,
+                "activityId": activity_id, "mentionContexts": [],
+                "mentionContextCount": 0, "userId": uid
+            }),
+            "expert" => json!({
+                "eventCode": "expert_actual_use", "timestamp": now, "reportDelay": 0,
+                "mode": "CLOUD", "id": "ex_backtoschool_2026", "name": "BackToSchool",
+                "expertTitle": "BackToSchool", "type": "02-Engineering",
+                "expertType": "agent", "source": "builtin", "version": "1.0.2",
+                "cost": 0, "characterCount": 12, "conversationId": cid,
+                "requestId": rid, "messageId": rid,
+                "requestModelId": "deepseek-v4-flash",
+                "requestModelName": "DeepSeek V4 Flash",
+                "activityId": activity_id, "userId": uid
+            }),
+            "desktop_seq" => json!({
+                "eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
+                "mode": "craft", "conversationId": cid, "requestId": rid,
+                "inputLength": 12, "requestModelId": "deepseek-v4-flash",
+                "requestModelName": "DeepSeek V4 Flash", "isPlan": false,
+                "agentName": "default", "agentType": "conversation",
+                "activityId": activity_id, "userId": uid
+            }),
+            _ => json!({ "eventCode": "heartbeat", "timestamp": now, "userId": uid }),
+        }
+    }
+
+    /// 带 mp 头的 GET。
+    async fn get_mp(
+        &self,
+        account: &WorkbuddyAccount,
+        url: &str,
+    ) -> Result<Value, String> {
+        let request = self.apply_mp_header(account, reqwest::Method::GET, url, None);
+        let (_, payload, _) = self
+            .send(account, request)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(payload)
+    }
+
+    /// 带 mp 头的 POST。
+    async fn post_mp(
+        &self,
+        account: &WorkbuddyAccount,
+        url: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), String> {
+        let request = self.apply_mp_header(account, reqwest::Method::POST, url, body);
+        let (status, payload, _) = self
+            .send(account, request)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((status, payload))
+    }
+
+    /// Sequential_Tasks_1：mp 口径查询 → accept → mini 对话点亮 → claim。
+    pub async fn run_miniprogram_growth(&self, account: &WorkbuddyAccount) -> ActivityRunLog {
+        let label = account_label(account);
+        let mut logs = Vec::new();
+        let mut earned = 0i64;
+        let uid = account.uid.clone().unwrap_or_default();
+        if uid.is_empty() {
+            return fail_log(account, "账号缺少 uid".into());
+        }
+        let realm = resolve_realm(account.domain.as_deref());
+        let tasks_url = format!("{}/v2/activity/growth/tasks", realm.chat_base());
+        let payload = match self.get_mp(account, &tasks_url).await {
+            Ok(p) => p,
+            Err(error) => {
+                return fail_log(account, format!("小程序任务查询失败: {}", error));
+            }
+        };
+        if payload.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
+            return fail_log(
+                account,
+                format!(
+                    "小程序任务接口: {}",
+                    payload.get("msg").and_then(Value::as_str).unwrap_or("未知错误")
+                ),
+            );
+        }
+        let tasks = payload
+            .get("data")
+            .and_then(|d| d.get("tasks"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let Some(task) = tasks
+            .iter()
+            .find(|t| t.get("task_code").and_then(Value::as_str) == Some("Sequential_Tasks_1"))
+            .cloned()
+        else {
+            logs.push("小程序任务 Sequential_Tasks_1 不在清单（可能未开放或已下线）".to_string());
+            return ActivityRunLog {
+                ok: true,
+                account_id: account.id.clone(),
+                label,
+                earned_credit: 0,
+                logs,
+            };
+        };
+        let status = task
+            .get("accept_status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_accepted")
+            .to_string();
+        if status == "claimed" {
+            logs.push("Sequential_Tasks_1 今日已领取".to_string());
+            return ActivityRunLog {
+                ok: true,
+                account_id: account.id.clone(),
+                label,
+                earned_credit: 0,
+                logs,
+            };
+        }
+        if status == "not_accepted" {
+            let accept_url = format!("{}/v2/activity/growth/tasks/accept", realm.chat_base());
+            let _ = self
+                .post_mp(
+                    account,
+                    &accept_url,
+                    Some(json!({ "task_codes": ["Sequential_Tasks_1"] })),
+                )
+                .await;
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+        }
+        // 点亮
+        let event = Self::build_miniprogram_chat_event(&uid, 0);
+        let report_url = format!("{}/v2/report", realm.bill_base());
+        let _ = self
+            .post_mp(account, &report_url, Some(json!([event])))
+            .await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        // claim（mp 头）
+        let claim_url = format!(
+            "{}/activity/growth/tasks/Sequential_Tasks_1/claim",
+            realm.chat_base()
+        );
+        match self.post_mp(account, &claim_url, None).await {
+            Ok((_, payload)) if payload.get("code").and_then(Value::as_i64) == Some(0) => {
+                let data = payload.get("data").cloned().unwrap_or(Value::Null);
+                let credit = data.get("credit").and_then(Value::as_i64).unwrap_or(0);
+                earned += credit;
+                logs.push(format!("✓ Sequential_Tasks_1 领奖 +{} 积分", credit));
+            }
+            Ok((_, payload)) => {
+                let msg = payload.get("msg").and_then(Value::as_str).unwrap_or("");
+                if msg.contains("already") || msg.contains("已领取") {
+                    logs.push("Sequential_Tasks_1 已领取".to_string());
+                } else {
+                    logs.push(format!("Sequential_Tasks_1 领奖: {}", msg));
+                }
+            }
+            Err(error) => logs.push(format!("Sequential_Tasks_1 领奖失败: {}", error)),
+        }
+        ActivityRunLog {
+            ok: true,
+            account_id: account.id.clone(),
+            label,
+            earned_credit: earned,
+            logs,
+        }
+    }
+
+    /// 开学季 4 任务全链。
+    pub async fn run_school_season(&self, account: &WorkbuddyAccount) -> ActivityRunLog {
+        let label = account_label(account);
+        let mut logs = Vec::new();
+        let mut earned = 0i64;
+        let uid = account.uid.clone().unwrap_or_default();
+        if uid.is_empty() {
+            return fail_log(account, "账号缺少 uid".into());
+        }
+        let list_url = format!("{}/portal/activity/school/tasks", CN_BILL_BASE);
+        let payload = match self.get_mp(account, &list_url).await {
+            Ok(p) => p,
+            Err(error) => {
+                return fail_log(account, format!("开学季任务查询失败: {}", error));
+            }
+        };
+        if payload.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
+            let msg = payload
+                .get("msg")
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
+            logs.push(format!("开学季任务接口: {}", msg));
+            return ActivityRunLog {
+                ok: false,
+                account_id: account.id.clone(),
+                label,
+                earned_credit: 0,
+                logs,
+            };
+        }
+        let data = payload.get("data").cloned().unwrap_or(Value::Null);
+        let activity_id = data
+            .get("activity_id")
+            .and_then(Value::as_str)
+            .unwrap_or("act_school_202609")
+            .to_string();
+        let tasks = data
+            .get("tasks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        const SCHOOL_MAP: &[(&str, &str, i64)] = &[
+            ("chat_3_times", "mini_chat", 3),
+            ("expert_use", "expert", 1),
+            ("desktop_chat_1_time", "desktop_seq", 1),
+        ];
+
+        for (code, kind, default_target) in SCHOOL_MAP {
+            let Some(task) = tasks
+                .iter()
+                .find(|t| t.get("task_code").and_then(Value::as_str) == Some(*code))
+                .cloned()
+            else {
+                continue;
+            };
+            let status = task
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending")
+                .to_lowercase();
+            if status == "completed" || status == "claimed" {
+                logs.push(format!("开学季 [{}] 已完成", code));
+                continue;
+            }
+            let progress = task
+                .get("progress")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let target = task
+                .get("target_count")
+                .and_then(Value::as_i64)
+                .unwrap_or(*default_target);
+            // viewed 激活
+            if status == "pending" {
+                let viewed_url = format!(
+                    "{}/portal/activity/school/tasks/{}/viewed",
+                    CN_BILL_BASE, code
+                );
+                let _ = self.post_mp(account, &viewed_url, None).await;
+                tokio::time::sleep(MIN_REQUEST_GAP).await;
+            }
+            let need = (target - progress).max(1);
+            for idx in 0..need {
+                let event = Self::build_school_event(&uid, kind, &activity_id, idx as usize);
+                let report_url = format!("{}/v2/report", CN_BILL_BASE);
+                let _ = self
+                    .post_mp(account, &report_url, Some(json!([event])))
+                    .await;
+                if idx + 1 < need {
+                    tokio::time::sleep(MIN_REQUEST_GAP).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let claim_url = format!(
+                "{}/portal/activity/school/tasks/{}/claim",
+                CN_BILL_BASE, code
+            );
+            match self.post_mp(account, &claim_url, None).await {
+                Ok((_, payload)) if payload.get("code").and_then(Value::as_i64) == Some(0) => {
+                    let data = payload.get("data").cloned().unwrap_or(Value::Null);
+                    let credit = data.get("reward_credit").and_then(Value::as_i64).unwrap_or(0);
+                    earned += credit;
+                    logs.push(format!("✓ 开学季 [{}] 领奖 +{} 积分", code, credit));
+                }
+                Ok((_, payload)) => {
+                    let msg = payload.get("msg").and_then(Value::as_str).unwrap_or("");
+                    logs.push(format!("开学季 [{}] 领奖: {}", code, msg));
+                }
+                Err(error) => logs.push(format!("开学季 [{}] 领奖失败: {}", code, error)),
+            }
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+        }
+
+        // share_invite：一次 share-complete
+        if let Some(task) = tasks
+            .iter()
+            .find(|t| t.get("task_code").and_then(Value::as_str) == Some("share_invite"))
+            .cloned()
+        {
+            let status = task
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending")
+                .to_lowercase();
+            if status != "completed" && status != "claimed" {
+                let share_url = format!(
+                    "{}/portal/activity/school/tasks/share-complete",
+                    CN_BILL_BASE
+                );
+                let _ = self
+                    .post_mp(
+                        account,
+                        &share_url,
+                        Some(json!({
+                            "activity_id": activity_id,
+                            "share_type": "link",
+                            "invite_code": format!("wb{}", &uid.chars().take(8).collect::<String>()),
+                        })),
+                    )
+                    .await;
+                tokio::time::sleep(MIN_REQUEST_GAP).await;
+                let claim_url = format!(
+                    "{}/portal/activity/school/tasks/share_invite/claim",
+                    CN_BILL_BASE
+                );
+                match self.post_mp(account, &claim_url, None).await {
+                    Ok((_, payload))
+                        if payload.get("code").and_then(Value::as_i64) == Some(0) =>
+                    {
+                        let credit = payload
+                            .get("data")
+                            .and_then(|d| d.get("reward_credit"))
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0);
+                        earned += credit;
+                        logs.push(format!("✓ 开学季 [share_invite] 领奖 +{} 积分", credit));
+                    }
+                    Ok((_, payload)) => {
+                        let msg = payload.get("msg").and_then(Value::as_str).unwrap_or("");
+                        logs.push(format!("开学季 [share_invite] 领奖: {}", msg));
+                    }
+                    Err(error) => {
+                        logs.push(format!("开学季 [share_invite] 领奖失败: {}", error))
+                    }
+                }
+            } else {
+                logs.push("开学季 [share_invite] 已完成".to_string());
+            }
+        }
+
+        if logs.is_empty() {
+            logs.push("开学季任务清单为空或活动未开放".to_string());
+        }
+        ActivityRunLog {
+            ok: true,
+            account_id: account.id.clone(),
+            label,
+            earned_credit: earned,
+            logs,
+        }
+    }
+
     /// 猫猫旅行闭环：arrived → 领奖；idle 且未达日限 → 派出。
     pub async fn cat_travel(&self, account: &WorkbuddyAccount) -> ActivityRunLog {
         let realm = resolve_realm(account.domain.as_deref());
@@ -806,6 +1708,15 @@ impl ActivityClient {
                 continue;
             }
 
+            // first_buddy 走专段领养链（report→agreement→buddy/first→claim）
+            if spec.kind == "buddy_first" {
+                logs.push("正在执行 first_buddy 领养链...".to_string());
+                let fb_logs = self.run_first_buddy(account).await;
+                logs.extend(fb_logs);
+                tokio::time::sleep(MIN_REQUEST_GAP).await;
+                continue;
+            }
+
             let need = (task.target - task.current).max(1);
             logs.push(format!("正在点亮任务 [{}] (需上报 {} 次)...", spec.name, need));
             for index in 0..need {
@@ -832,6 +1743,18 @@ impl ActivityClient {
         let travel = self.cat_travel(account).await;
         logs.extend(travel.logs);
         earned += travel.earned_credit;
+
+        // 连登奖励闭环（按天幂等）
+        if !reward_claimed_today(&account.id) {
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+            let (reward_logs, reward_earned) = self.claim_growth_rewards(account).await;
+            if !reward_logs.is_empty() {
+                logs.push("—— 连登奖励 ——".to_string());
+                logs.extend(reward_logs);
+            }
+            earned += reward_earned;
+            mark_reward_claimed(&account.id);
+        }
 
         logger::log_info(&format!(
             "[WorkbuddyActivity] 成长任务完成 account={} earned={}",
@@ -892,6 +1815,28 @@ fn truncate(value: &str, limit: usize) -> String {
         return value.to_string();
     }
     value.chars().take(limit).collect()
+}
+
+// ── 连登奖励按天幂等（进程内） ────────────────────────────────
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+lazy_static::lazy_static! {
+    static ref REWARD_CLAIMED: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+}
+
+fn reward_claimed_today(account_id: &str) -> bool {
+    REWARD_CLAIMED
+        .lock()
+        .ok()
+        .map(|map| map.get(account_id).map(|day| day == &cst_today()).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+fn mark_reward_claimed(account_id: &str) {
+    if let Ok(mut map) = REWARD_CLAIMED.lock() {
+        map.insert(account_id.to_string(), cst_today());
+    }
 }
 
 /// 便捷入口：按账号 id 执行成长任务自动化。
@@ -1025,11 +1970,12 @@ impl ActivityClient {
         }
     }
 
-    /// 活跃上报：连发对话事件，点亮连登/对话类任务。
+    /// 活跃上报：连发对话事件，点亮连登/对话类任务；成功后跑连登奖励闭环。
     pub async fn run_activity_report(&self, account: &WorkbuddyAccount) -> ActivityRunLog {
         let realm = resolve_realm(account.domain.as_deref());
         let label = account_label(account);
         let mut logs = Vec::new();
+        let mut earned = 0i64;
         if realm != WorkbuddyRealm::Cn {
             return ActivityRunLog {
                 ok: false,
@@ -1050,10 +1996,14 @@ impl ActivityClient {
             };
         }
         logs.push("开始活跃上报（对话事件 x5）...".to_string());
+        let mut ok_count = 0;
         for index in 0..5 {
             let event = build_event(&uid, "chat", index);
             match self.report_events(account, &[event], true).await {
-                Ok(true) => logs.push(format!("✓ 对话事件 {}/5 上报成功", index + 1)),
+                Ok(true) => {
+                    ok_count += 1;
+                    logs.push(format!("✓ 对话事件 {}/5 上报成功", index + 1));
+                }
                 Ok(false) => logs.push(format!("! 对话事件 {}/5 上报被拒", index + 1)),
                 Err(error) => logs.push(format!("! 对话事件 {}/5 上报失败: {}", index + 1, error)),
             }
@@ -1061,11 +2011,22 @@ impl ActivityClient {
                 tokio::time::sleep(MIN_REQUEST_GAP).await;
             }
         }
+        // 上报全满 → 连登奖励闭环（对齐 workbuddy2api runActivity：report 成功后 claimGrowthRewards）
+        if ok_count == 5 && !reward_claimed_today(&account.id) {
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+            let (reward_logs, reward_earned) = self.claim_growth_rewards(account).await;
+            if !reward_logs.is_empty() {
+                logs.push("—— 连登奖励 ——".to_string());
+                logs.extend(reward_logs);
+            }
+            earned += reward_earned;
+            mark_reward_claimed(&account.id);
+        }
         ActivityRunLog {
             ok: true,
             account_id: account.id.clone(),
             label,
-            earned_credit: 0,
+            earned_credit: earned,
             logs,
         }
     }
@@ -1115,11 +2076,36 @@ fn fail_log(account: &WorkbuddyAccount, message: String) -> ActivityRunLog {
 
 /// 对单个账号执行指定活动类型。
 pub async fn run_kind_for_account(kind: &str, account_id: &str) -> Result<ActivityRunLog, String> {
-    match kind {
-        "growth" | "schoolSeason" => run_growth_tasks_for_account(account_id).await,
+    // WAF 冷却短路（单号入口）
+    if let Some(remaining) = workbuddy_activity_waf::gate().remaining(account_id) {
+        let account = workbuddy_account::load_account(account_id);
+        let label = account
+            .as_ref()
+            .map(account_label)
+            .unwrap_or_else(|| account_id.to_string());
+        let account_id = account
+            .as_ref()
+            .map(|a| a.id.clone())
+            .unwrap_or_else(|| account_id.to_string());
+        return Ok(ActivityRunLog {
+            ok: false,
+            account_id,
+            label,
+            earned_credit: 0,
+            logs: vec![format!(
+                "WAF 冷却中，跳过（剩余 {}s）",
+                remaining.as_secs().max(1)
+            )],
+        });
+    }
+    let result = match kind {
+        "growth" => run_growth_tasks_for_account(account_id).await,
+        "schoolSeason" | "school" => run_school_season_for_account(account_id).await,
+        "miniprogram" | "minichat" => run_miniprogram_growth_for_account(account_id).await,
         "catTravel" | "cat" => cat_travel_for_account(account_id).await,
         "nightCat" => run_night_cat_for_account(account_id).await,
         "activityReport" | "activity_report" => run_activity_report_for_account(account_id).await,
+        "streakRewards" | "streak" => run_streak_rewards_for_account(account_id).await,
         "checkin" => {
             let account = workbuddy_account::load_account(account_id)
                 .ok_or_else(|| format!("账号不存在: {}", account_id))?;
@@ -1183,15 +2169,83 @@ pub async fn run_kind_for_account(kind: &str, account_id: &str) -> Result<Activi
             }
         }
         other => Err(format!("未知活动类型: {}", other)),
+    };
+    if let Ok(ref result) = result {
+        let _ = crate::modules::workbuddy_activity_cache::put_run_log(
+            &result.account_id,
+            kind,
+            result.clone(),
+        );
     }
+    result
 }
 
-/// 全账号批量执行：仅国内版，账号间强制 >=1s 间隔。
+/// 便捷入口：开学季任务。
+pub async fn run_school_season_for_account(account_id: &str) -> Result<ActivityRunLog, String> {
+    let account = workbuddy_account::load_account(account_id)
+        .ok_or_else(|| format!("账号不存在: {}", account_id))?;
+    let client = ActivityClient::new()?;
+    Ok(client.run_school_season(&account).await)
+}
+
+/// 便捷入口：小程序成长任务 Sequential_Tasks_1。
+pub async fn run_miniprogram_growth_for_account(
+    account_id: &str,
+) -> Result<ActivityRunLog, String> {
+    let account = workbuddy_account::load_account(account_id)
+        .ok_or_else(|| format!("账号不存在: {}", account_id))?;
+    let client = ActivityClient::new()?;
+    Ok(client.run_miniprogram_growth(&account).await)
+}
+
+/// 便捷入口：仅连登奖励闭环。
+pub async fn run_streak_rewards_for_account(account_id: &str) -> Result<ActivityRunLog, String> {
+    let account = workbuddy_account::load_account(account_id)
+        .ok_or_else(|| format!("账号不存在: {}", account_id))?;
+    let client = ActivityClient::new()?;
+    if reward_claimed_today(account_id) {
+        return Ok(ActivityRunLog {
+            ok: true,
+            account_id: account.id.clone(),
+            label: account_label(&account),
+            earned_credit: 0,
+            logs: vec!["今日连登奖励已处理".to_string()],
+        });
+    }
+    let (logs, earned) = client.claim_growth_rewards(&account).await;
+    mark_reward_claimed(account_id);
+    Ok(ActivityRunLog {
+        ok: true,
+        account_id: account.id.clone(),
+        label: account_label(&account),
+        earned_credit: earned,
+        logs: if logs.is_empty() {
+            vec!["连登奖励无可领档位".to_string()]
+        } else {
+            logs
+        },
+    })
+}
+
+/// 全账号批量执行：仅国内版，账号间强制 >=1s 间隔；跳过 WAF 冷却中账号。
 pub async fn run_kind_for_all_accounts(kind: &str) -> Result<Vec<ActivityRunLog>, String> {
     let accounts = workbuddy_account::list_accounts();
     let mut results = Vec::new();
     for account in accounts {
         if !is_cn_account(&account) {
+            continue;
+        }
+        if workbuddy_activity_waf::gate().is_cooling(&account.id) {
+            let remaining = workbuddy_activity_waf::gate()
+                .remaining(&account.id)
+                .unwrap_or_default();
+            results.push(fail_log(
+                &account,
+                format!(
+                    "WAF 冷却中，跳过（剩余 {}s）",
+                    remaining.as_secs().max(1)
+                ),
+            ));
             continue;
         }
         let result = run_kind_for_account(kind, &account.id).await.unwrap_or_else(|err| {
@@ -1232,6 +2286,19 @@ pub async fn run_daily_all_accounts() -> Result<Vec<ActivityRunLog>, String> {
         if !is_cn_account(&account) {
             continue;
         }
+        if workbuddy_activity_waf::gate().is_cooling(&account.id) {
+            let remaining = workbuddy_activity_waf::gate()
+                .remaining(&account.id)
+                .unwrap_or_default();
+            results.push(fail_log(
+                &account,
+                format!(
+                    "WAF 冷却中，跳过一键日常（剩余 {}s）",
+                    remaining.as_secs().max(1)
+                ),
+            ));
+            continue;
+        }
         for (kind_str, log_kind) in steps {
             let result = run_kind_for_account(kind_str, &account.id)
                 .await
@@ -1258,12 +2325,14 @@ pub async fn run_daily_all_accounts() -> Result<Vec<ActivityRunLog>, String> {
 }
 
 /// 全账号总览；`use_cache=true` 时优先读 5 分钟内缓存。
+/// 未命中缓存的账号逐个拉取，账号间强制 `MIN_REQUEST_GAP`（防风控）。
 pub async fn overview_all_accounts(
     use_cache: bool,
     force_refresh: bool,
 ) -> Result<Vec<(String, ActivityOverview)>, String> {
     let accounts = workbuddy_account::list_accounts();
     let mut out = Vec::new();
+    let mut first_fetch = true;
     for account in accounts {
         if !is_cn_account(&account) {
             continue;
@@ -1276,6 +2345,10 @@ pub async fn overview_all_accounts(
                 continue;
             }
         }
+        if !first_fetch {
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+        }
+        first_fetch = false;
         match overview_for_account(&account.id).await {
             Ok(overview) => {
                 let _ =
@@ -1301,8 +2374,92 @@ pub async fn overview_all_accounts(
                 ));
             }
         }
-        tokio::time::sleep(MIN_REQUEST_GAP).await;
     }
+    Ok(out)
+}
+
+/// 单账号强制刷新总览（绕过 TTL，仍写回缓存）。
+pub async fn refresh_overview_account(
+    account_id: &str,
+) -> Result<ActivityOverview, String> {
+    let overview = overview_for_account(account_id).await?;
+    let _ = crate::modules::workbuddy_activity_cache::put_overview(account_id, overview.clone());
+    Ok(overview)
+}
+
+/// 全账号慢刷总览：账号间 `slow_gap`，并通过 `on_progress(done, total, account_id)` 回报进度。
+/// 用于「全部刷新」——不读缓存，逐号拉接口，避免一次打爆上游。
+pub async fn refresh_overview_all_slow<F>(
+    slow_gap: Duration,
+    mut on_progress: F,
+) -> Result<Vec<(String, ActivityOverview)>, String>
+where
+    F: FnMut(usize, usize, &str),
+{
+    let accounts: Vec<_> = workbuddy_account::list_accounts()
+        .into_iter()
+        .filter(is_cn_account)
+        .collect();
+    let total = accounts.len();
+    let mut out = Vec::new();
+    for (index, account) in accounts.iter().enumerate() {
+        on_progress(index, total, &account.id);
+        if index > 0 {
+            tokio::time::sleep(slow_gap).await;
+        }
+        // 冷却中账号跳过网络，只回缓存/占位
+        if workbuddy_activity_waf::gate().is_cooling(&account.id) {
+            let cached = crate::modules::workbuddy_activity_cache::get_cached_overview_stale(
+                &account.id,
+            )
+            .ok()
+            .flatten()
+            .map(|(ov, _)| ov);
+            let overview = cached.unwrap_or(ActivityOverview {
+                ok: false,
+                realm: resolve_realm(account.domain.as_deref()),
+                energy: 0,
+                streak_days: 0,
+                travel: TravelStatus {
+                    state: "unknown".to_string(),
+                    daily_limit_reached: false,
+                    raw: Value::Null,
+                },
+                tasks: Vec::new(),
+                message: "WAF 冷却中，跳过刷新".to_string(),
+            });
+            out.push((account.id.clone(), overview));
+            continue;
+        }
+        match overview_for_account(&account.id).await {
+            Ok(overview) => {
+                let _ = crate::modules::workbuddy_activity_cache::put_overview(
+                    &account.id,
+                    overview.clone(),
+                );
+                out.push((account.id.clone(), overview));
+            }
+            Err(error) => {
+                out.push((
+                    account.id.clone(),
+                    ActivityOverview {
+                        ok: false,
+                        realm: resolve_realm(account.domain.as_deref()),
+                        energy: 0,
+                        streak_days: 0,
+                        travel: TravelStatus {
+                            state: "unknown".to_string(),
+                            daily_limit_reached: false,
+                            raw: Value::Null,
+                        },
+                        tasks: Vec::new(),
+                        message: error,
+                    },
+                ));
+            }
+        }
+    }
+    on_progress(total, total, "");
     Ok(out)
 }
 

@@ -92,6 +92,22 @@ pub async fn codebuddy_local_access_test() -> Result<CodebuddyLocalAccessTestRes
     Ok(codebuddy_local_access::test_service().await)
 }
 
+/// Governance ledger + request log from the running sidecar.
+#[tauri::command]
+pub async fn codebuddy_local_access_runtime_status(
+) -> Result<crate::models::codebuddy_local_access::CodebuddyRuntimeStatus, String> {
+    codebuddy_local_access::fetch_runtime_status().await
+}
+
+/// Paginated request-log window from the running sidecar.
+#[tauri::command]
+pub async fn codebuddy_local_access_runtime_requests(
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    codebuddy_local_access::fetch_runtime_requests(offset, limit).await
+}
+
 /// 直连上游企业模型接口，拉取所选账号真实可用的模型（含显示名/上下文/推理档位）。
 #[tauri::command]
 pub async fn codebuddy_local_access_fetch_models() -> Result<CodebuddyFetchModelsResult, String> {
