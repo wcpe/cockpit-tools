@@ -393,6 +393,7 @@ type providerGatewayModelCapability struct {
 // proxy keeps working between manifest rewrites.
 type codebuddyUpstreamSpec struct {
 	ID               string   `json:"id"`
+	UID              string   `json:"uid,omitempty"`
 	Label            string   `json:"label,omitempty"`
 	Platform         string   `json:"platform,omitempty"`
 	BaseURL          string   `json:"baseUrl"`

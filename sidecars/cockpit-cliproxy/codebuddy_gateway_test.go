@@ -188,8 +188,10 @@ func TestCodebuddyStreamRewritesModelAndStripsGatewayFields(t *testing.T) {
 	if _, ok := gotBody["max_completion_tokens"]; ok {
 		t.Fatal("max_completion_tokens should be dropped")
 	}
-	if _, ok := gotBody["stream_options"]; ok {
-		t.Fatal("stream_options should be dropped")
+	// Gateway injects stream_options.include_usage so the last SSE frame carries credit/tokens.
+	so, _ := gotBody["stream_options"].(map[string]any)
+	if so == nil || so["include_usage"] != true {
+		t.Fatalf("stream_options.include_usage should be true: %#v", gotBody["stream_options"])
 	}
 	if _, ok := gotBody["n"]; ok {
 		t.Fatal("n>1 should be dropped")

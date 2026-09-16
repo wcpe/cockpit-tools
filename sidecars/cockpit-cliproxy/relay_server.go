@@ -53,6 +53,8 @@ func (s *relayServer) router() *gin.Engine {
 	})
 	router.Use(s.policy.middleware())
 	router.GET("/v1/models", s.handleModels)
+	router.GET("/v1/codebuddy/status", s.handleCodebuddyStatus)
+	router.GET("/v1/codebuddy/requests", s.handleCodebuddyRequests)
 	router.GET(cockpitQuotaPath, s.handleCockpitQuota)
 	router.POST("/v1/cockpit/auth/reset", s.handleResetAuthState)
 	router.POST("/v1/cockpit/accounts/reset-scheduler", s.handleResetSchedulerState)
