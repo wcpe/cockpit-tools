@@ -1264,15 +1264,29 @@ pub fn run() {
             commands::codebuddy_local_access::codebuddy_local_access_get_state,
             commands::codebuddy_local_access::codebuddy_local_access_save,
             commands::codebuddy_local_access::codebuddy_local_access_start,
+            commands::codebuddy_local_access::codebuddy_local_access_save_client_keys,
+            commands::codebuddy_local_access::codebuddy_local_access_save_api_keys,
+            commands::codebuddy_local_access::codebuddy_local_access_set_model_groups,
+            commands::codebuddy_local_access::codebuddy_local_access_get_model_groups,
             commands::codebuddy_local_access::codebuddy_local_access_stop,
             commands::codebuddy_local_access::codebuddy_local_access_restart,
             commands::codebuddy_local_access::codebuddy_local_access_rotate_api_key,
             commands::codebuddy_local_access::codebuddy_local_access_test,
             commands::codebuddy_local_access::codebuddy_local_access_runtime_status,
             commands::codebuddy_local_access::codebuddy_local_access_runtime_requests,
+            commands::codebuddy_local_access::codebuddy_local_access_query_request_logs,
+            commands::codebuddy_local_access::codebuddy_local_access_query_usage_stats,
+            commands::codebuddy_local_access::codebuddy_local_access_clear_request_logs,
             commands::codebuddy_local_access::codebuddy_local_access_fetch_models,
             commands::codebuddy_local_access::codebuddy_local_access_probe_chat,
             commands::codebuddy_local_access::codebuddy_local_access_default_models,
+            commands::codebuddy_local_access::codebuddy_local_access_set_disabled_models,
+            commands::codebuddy_local_access::codebuddy_local_access_set_night_free,
+            commands::codebuddy_local_access::codebuddy_local_access_set_account_free_models,
+            commands::codebuddy_local_access::codebuddy_local_access_get_model_catalog,
+            commands::codebuddy_local_access::codebuddy_local_access_query_request_logs_by_key,
+            commands::codebuddy_local_access::codebuddy_local_access_api_key_stats,
+            commands::codebuddy_local_access::codebuddy_local_access_clear_sticky_sessions,
             commands::codebuddy::delete_codebuddy_account,
             commands::codebuddy::delete_codebuddy_accounts,
             commands::codebuddy::import_codebuddy_from_json,
@@ -1718,3 +1732,5 @@ pub fn run() {
         }
     });
 }
+
+

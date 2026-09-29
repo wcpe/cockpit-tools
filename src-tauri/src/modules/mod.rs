@@ -20,6 +20,7 @@ pub mod codebuddy_cn_instance;
 pub mod codebuddy_cn_oauth;
 pub mod codebuddy_instance;
 pub mod codebuddy_local_access;
+pub mod codebuddy_local_access_request_logs;
 pub mod codebuddy_oauth;
 pub mod codebuddy_session;
 pub mod codebuddy_session_transfer;

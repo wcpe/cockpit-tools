@@ -38,7 +38,7 @@ const RUNTIME_DIR: &str = "codebuddy_local_access_sidecar";
 const SIDECAR_CONFIG_FILE: &str = "config.json";
 const SIDECAR_MANIFEST_FILE: &str = "manifest.json";
 const SIDECAR_AUTHS_DIR: &str = "auths";
-const SIDECAR_API_KEY_ID: &str = "codebuddy_api_service";
+pub const SIDECAR_API_KEY_ID: &str = "codebuddy_api_service";
 const LOCALHOST_BIND_HOST: &str = "127.0.0.1";
 const LAN_BIND_HOST: &str = "0.0.0.0";
 const CLIENT_URL_HOST: &str = "127.0.0.1";
@@ -177,6 +177,9 @@ struct ResolvedAccount {
     access_token: String,
     refresh_token: Option<String>,
     expires_at_ms: Option<i64>,
+    credits_remain: Option<i64>,
+    credits_size: Option<i64>,
+    realm: String,
 }
 
 fn resolve_account(
@@ -184,35 +187,55 @@ fn resolve_account(
     account_id: &str,
 ) -> Result<ResolvedAccount, String> {
     let missing = || format!("账号不存在或已删除: {}", account_id);
+    let realm_for = |platform: CodebuddyLocalAccessPlatform| -> String {
+        match platform {
+            CodebuddyLocalAccessPlatform::Workbuddy | CodebuddyLocalAccessPlatform::CodebuddyCn => {
+                "cn".to_string()
+            }
+            CodebuddyLocalAccessPlatform::Codebuddy => "global".to_string(),
+        }
+    };
     let resolved = match platform {
         CodebuddyLocalAccessPlatform::Workbuddy => {
             let account = workbuddy_account::load_account(account_id).ok_or_else(missing)?;
+            let (remain, size) = quota_credits_from_raw(account.quota_raw.as_ref());
             ResolvedAccount {
                 label: account.email.clone(),
                 uid: account.uid.clone(),
                 access_token: account.access_token,
                 refresh_token: account.refresh_token,
                 expires_at_ms: account.expires_at,
+                credits_remain: remain,
+                credits_size: size,
+                realm: realm_for(platform),
             }
         }
         CodebuddyLocalAccessPlatform::CodebuddyCn => {
             let account = codebuddy_cn_account::load_account(account_id).ok_or_else(missing)?;
+            let (remain, size) = quota_credits_from_raw(account.quota_raw.as_ref());
             ResolvedAccount {
                 label: account.email.clone(),
                 uid: account.uid.clone(),
                 access_token: account.access_token,
                 refresh_token: account.refresh_token,
                 expires_at_ms: account.expires_at,
+                credits_remain: remain,
+                credits_size: size,
+                realm: realm_for(platform),
             }
         }
         CodebuddyLocalAccessPlatform::Codebuddy => {
             let account = codebuddy_account::load_account(account_id).ok_or_else(missing)?;
+            let (remain, size) = quota_credits_from_raw(account.quota_raw.as_ref());
             ResolvedAccount {
                 label: account.email.clone(),
                 uid: account.uid.clone(),
                 access_token: account.access_token,
                 refresh_token: account.refresh_token,
                 expires_at_ms: account.expires_at,
+                credits_remain: remain,
+                credits_size: size,
+                realm: realm_for(platform),
             }
         }
     };
@@ -332,32 +355,146 @@ fn build_manifest(collection: &CodebuddyLocalAccessCollection) -> Result<Value, 
             "accessToken": resolved.access_token,
             "refreshToken": resolved.refresh_token,
             "includeReasoning": collection.include_reasoning,
+            "realm": resolved.realm,
+            "credits": resolved.credits_remain,
+            "creditsExpiring": resolved.credits_size,
+            "alwaysFreeModels": entry.always_free_models,
+            "nightOnlyFreeModels": entry.night_only_free_models,
+            "modelCatalog": collection
+                .account_model_catalogs
+                .iter()
+                .find(|c| c.account_id == entry.account_id)
+                .map(|c| c.models.clone())
+                .unwrap_or_default(),
         }));
     }
     if upstreams.is_empty() {
         return Err("请至少选择一个 CodeBuddy / WorkBuddy 账号".to_string());
     }
 
+    // Unified API keys — every key is equal; modelGroup binding sets accountIds/allowedModels.
+    let mut api_keys = Vec::new();
+    for entry in collection.all_api_keys() {
+        let key = entry.key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let id = if entry.id.trim().is_empty() {
+            format!("ck_{}", &key.chars().take(8).collect::<String>())
+        } else {
+            entry.id.clone()
+        };
+        let label = if entry.label.trim().is_empty() {
+            id.clone()
+        } else {
+            entry.label.clone()
+        };
+        let mut account_ids: Vec<String> = Vec::new();
+        let mut allowed_models: Vec<String> = Vec::new();
+        if let Some(gid) = entry.model_group_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
+        {
+            if let Some(group) = collection.model_group_by_id(gid) {
+                for acc in &collection.accounts {
+                    if group.contains_account(acc.platform, &acc.account_id) {
+                        account_ids.push(acc.account_id.clone());
+                    }
+                }
+                allowed_models = group.model_ids.clone();
+            }
+        }
+        api_keys.push(json!({
+            "id": id,
+            "label": label,
+            "key": key,
+            "enabled": entry.enabled,
+            "upstreamKind": "codebuddy",
+            "modelGroupId": entry.model_group_id,
+            "accountIds": account_ids,
+            "allowedModels": allowed_models,
+            "excludedModels": Vec::<String>::new(),
+        }));
+    }
+    if api_keys.is_empty() {
+        return Err("请至少配置一个 API Key".to_string());
+    }
+
+    let model_groups: Vec<Value> = collection
+        .model_groups
+        .iter()
+        .map(|g| {
+            json!({
+                "id": g.id,
+                "name": g.name,
+                "accountIds": g.account_ids,
+                "accountKeys": g.account_keys,
+                "modelIds": g.model_ids,
+                "kind": g.kind,
+            })
+        })
+        .collect();
+
+    let account_catalogs: Vec<Value> = collection
+        .account_model_catalogs
+        .iter()
+        .map(|c| {
+            json!({
+                "accountId": c.account_id,
+                "platform": c.platform,
+                "label": c.label,
+                "models": c.models,
+            })
+        })
+        .collect();
+
+    let mut model_efforts = serde_json::Map::new();
+    let mut model_credits = serde_json::Map::new();
+    for row in &collection.model_catalog {
+        if let Some(obj) = row.as_object() {
+            if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                if let Some(efforts) = obj.get("efforts") {
+                    model_efforts.insert(id.to_string(), efforts.clone());
+                }
+                if let Some(credits) = obj.get("credits") {
+                    model_credits.insert(id.to_string(), credits.clone());
+                }
+            }
+        }
+    }
+    // Merge per-account catalogs into global credits map (first wins).
+    for cat in &collection.account_model_catalogs {
+        for row in &cat.models {
+            if let Some(obj) = row.as_object() {
+                if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                    if let Some(credits) = obj.get("credits") {
+                        model_credits.entry(id.to_string()).or_insert_with(|| credits.clone());
+                    }
+                }
+            }
+        }
+    }
+
     let mut manifest = json!({
         "locale": "zh-CN",
-        "apiKeys": [{
-            "id": SIDECAR_API_KEY_ID,
-            "label": "CodeBuddy API Service",
-            "key": collection.api_key,
-            "enabled": true,
-            "upstreamKind": "codebuddy",
-            "accountIds": [],
-            "allowedModels": [],
-            "excludedModels": [],
-        }],
+        "apiKeys": api_keys,
         "accounts": [],
         "modelIds": [],
+        "modelGroups": model_groups,
+        "accountModelCatalogs": account_catalogs,
         "routingStrategy": match collection.routing_strategy {
             crate::models::codebuddy_local_access::CodebuddyLocalAccessRoutingStrategy::Random => "random",
             _ => "round_robin",
         },
         "debugLogs": true,
         "codebuddyUpstreams": upstreams,
+        "disabledModels": collection.disabled_models,
+        "modelCatalog": collection.model_catalog,
+        "modelEfforts": model_efforts,
+        "modelCredits": model_credits,
+        "costExploreInterval": "30m",
+        "nightFreeEnabled": collection.night_free_enabled,
+        "nightFreeModels": collection.night_free_models,
+        "nightFreeStartHour": 23,
+        "nightFreeEndHour": 8,
     });
     if !collection.model_ids.is_empty() {
         // Only override the account-level catalog when the user curated one.
@@ -376,12 +513,32 @@ fn build_manifest(collection: &CodebuddyLocalAccessCollection) -> Result<Value, 
 }
 
 fn sidecar_config(collection: &CodebuddyLocalAccessCollection, auth_dir: &Path) -> Value {
+    // CLIProxy 网关层只认 config 的 api-keys；客户端密钥也必须写进去，
+    // 否则多把 key 会在鉴权中间件被 401，根本到不了 codebuddy manifest 策略。
+    let mut api_keys = Vec::new();
+    let primary = collection.api_key.trim();
+    if !primary.is_empty() {
+        api_keys.push(primary.to_string());
+    }
+    for entry in &collection.client_keys {
+        let key = entry.key.trim();
+        if key.is_empty() || !entry.enabled {
+            continue;
+        }
+        if !api_keys.iter().any(|existing| existing == key) {
+            api_keys.push(key.to_string());
+        }
+    }
+    if api_keys.is_empty() {
+        // 兜底：至少保留主 key 字段，避免空数组触发 safemode 模板检测异常。
+        api_keys.push(collection.api_key.clone());
+    }
     json!({
         "host": bind_host_for_scope(collection.access_scope),
         "port": collection.port,
         "auth-dir": auth_dir.to_string_lossy(),
         "debug": false,
-        "api-keys": [collection.api_key],
+        "api-keys": api_keys,
         "api-key-account-ids": [SIDECAR_API_KEY_ID],
         "commercial-mode": true,
         "ws-auth": true,
@@ -431,6 +588,28 @@ async fn handle_sidecar_event(collection: &CodebuddyLocalAccessCollection, line:
                     .get("host")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+            }
+        }
+        Some("codebuddy_usage") => {
+            match serde_json::from_value::<crate::models::codebuddy_local_access::CodebuddyRequestRecord>(
+                payload.clone(),
+            ) {
+                Ok(record) => {
+                    if let Err(error) =
+                        crate::modules::codebuddy_local_access_request_logs::record_usage_event(
+                            &record,
+                        )
+                    {
+                        logger::log_codex_api_warn(&format!(
+                            "[CodebuddyLocalAccess] 写入请求历史库失败: {}",
+                            error
+                        ));
+                    }
+                }
+                Err(error) => logger::log_codex_api_warn(&format!(
+                    "[CodebuddyLocalAccess] codebuddy_usage 事件解析失败: {}",
+                    error
+                )),
             }
         }
         Some("codebuddy_token_refreshed") => {
@@ -524,6 +703,12 @@ pub async fn start_service(collection: &CodebuddyLocalAccessCollection) -> Resul
 
     let mut command = TokioCommand::new(&binary);
     sanitize_sidecar_command_env(&mut command);
+    if let Ok(data_dir) = account::get_data_dir() {
+        let state_dir = data_dir.join(RUNTIME_DIR);
+        let _ = std::fs::create_dir_all(&state_dir);
+        command.env("COCKPIT_CODEBUDDY_STATE_DIR", &state_dir);
+        command.env("COCKPIT_TOOLS_DATA_DIR", &data_dir);
+    }
     command
         .arg("--config")
         .arg(&config_path)
@@ -617,21 +802,14 @@ fn quota_credits_from_raw(quota_raw: Option<&serde_json::Value>) -> (Option<i64>
     };
     let mut remain_total = 0i64;
     let mut size_total = 0i64;
+    let mut expiring_total = 0i64;
     let mut found = false;
+    // soon window for "expiring" bucket (align workbuddy2api default 7d).
+    let soon_ms = 7i64 * 24 * 3600 * 1000;
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let mut walk = |node: &serde_json::Value| {
         let obj = match node {
             serde_json::Value::Object(map) => map,
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    // Recurse into arrays.
-                    if item.is_object() {
-                        if let Some(map) = item.as_object() {
-                            let _ = map;
-                        }
-                    }
-                }
-                return;
-            }
             _ => return,
         };
         let remain = obj
@@ -647,25 +825,44 @@ fn quota_credits_from_raw(quota_raw: Option<&serde_json::Value>) -> (Option<i64>
             .and_then(serde_json::Value::as_i64);
         if remain.is_some() || size.is_some() {
             found = true;
-            remain_total += remain.unwrap_or(0);
+            let r = remain.unwrap_or(0).max(0);
+            remain_total += r;
             size_total += size.unwrap_or(0);
-        }
-    };
-    // Flatten: walk common container shapes.
-    fn collect_objects(node: &serde_json::Value, out: &mut Vec<serde_json::Map<String, serde_json::Value>>) {
-        match node {
-            serde_json::Value::Object(map) => {
-                out.push(map.clone());
-                for value in map.values() {
-                    collect_objects(value, out);
+            // Expiring bucket: CycleEndTime "2006-01-02 15:04:05" (UTC+8 wall clock)
+            // within soon window. Missing/unparsable → stable (do not over-prioritize).
+            if r > 0 {
+                if let Some(end) = obj
+                    .get("CycleEndTime")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(end, "%Y-%m-%d %H:%M:%S") {
+                        use chrono::TimeZone;
+                        let end_cst = chrono::FixedOffset::east_opt(8 * 3600)
+                            .and_then(|tz| tz.from_local_datetime(&dt).single())
+                            .map(|d| d.timestamp_millis())
+                            .unwrap_or_else(|| dt.and_utc().timestamp_millis() + 8 * 3600 * 1000);
+                        if end_cst - now_ms <= soon_ms {
+                            expiring_total += r;
+                        }
+                    }
                 }
             }
+        }
+    };
+    fn collect_objects(node: &serde_json::Value, out: &mut Vec<serde_json::Map<String, serde_json::Value>>) {
+        let obj = match node {
+            serde_json::Value::Object(map) => map,
             serde_json::Value::Array(items) => {
                 for item in items {
                     collect_objects(item, out);
                 }
+                return;
             }
-            _ => {}
+            _ => return,
+        };
+        out.push(obj.clone());
+        for value in obj.values() {
+            collect_objects(value, out);
         }
     }
     let mut objects = Vec::new();
@@ -676,7 +873,9 @@ fn quota_credits_from_raw(quota_raw: Option<&serde_json::Value>) -> (Option<i64>
     if !found {
         return (None, None);
     }
-    (Some(remain_total.max(0)), Some(size_total.max(0)))
+    // Return (remain, expiring) — size is not used as expiring by pool weight.
+    let _ = size_total;
+    (Some(remain_total.max(0)), Some(expiring_total.max(0).min(remain_total.max(0))))
 }
 
 fn account_options(
@@ -855,7 +1054,8 @@ pub async fn fetch_runtime_requests(
         return Err("服务未运行，请先启动服务".to_string());
     };
     let offset = offset.unwrap_or(0).min(500);
-    let limit = limit.unwrap_or(20).clamp(1, 100);
+    // Backfill may request the full ring; UI pages stay much smaller.
+    let limit = limit.unwrap_or(20).clamp(1, 500);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -874,6 +1074,48 @@ pub async fn fetch_runtime_requests(
     resp.json()
         .await
         .map_err(|e| format!("解析请求流水失败: {}", e))
+}
+
+/// When the durable SQLite store is empty but the sidecar still holds a live
+/// ring buffer, ingest those records once so history is not lost after upgrade.
+pub async fn maybe_backfill_request_logs() {
+    match crate::modules::codebuddy_local_access_request_logs::request_logs_count() {
+        Ok(0) => {}
+        Ok(_) => return,
+        Err(error) => {
+            logger::log_codex_api_warn(&format!(
+                "[CodebuddyLocalAccess] 查询请求历史库失败，跳过回填: {}",
+                error
+            ));
+            return;
+        }
+    }
+    let Ok(value) = fetch_runtime_requests(None, Some(500)).await else {
+        return;
+    };
+    let Some(records) = value.get("records").and_then(Value::as_array).cloned() else {
+        return;
+    };
+    let parsed: Vec<crate::models::codebuddy_local_access::CodebuddyRequestRecord> = records
+        .into_iter()
+        .filter_map(|item| serde_json::from_value(item).ok())
+        .collect();
+    if parsed.is_empty() {
+        return;
+    }
+    match crate::modules::codebuddy_local_access_request_logs::backfill_from_sidecar_records(
+        &parsed,
+    ) {
+        Ok(count) if count > 0 => logger::log_codex_api_info(&format!(
+            "[CodebuddyLocalAccess] 已从 sidecar 回填请求历史 {} 条",
+            count
+        )),
+        Ok(_) => {}
+        Err(error) => logger::log_codex_api_warn(&format!(
+            "[CodebuddyLocalAccess] 回填请求历史失败: {}",
+            error
+        )),
+    }
 }
 
 /// Probe the running service. Uses `/v1/models` so the check never spends
@@ -975,6 +1217,43 @@ pub async fn apply_collection(
     Ok(service_state().await)
 }
 
+/// 仅更新客户端密钥（名称/开关/新增删除），**不重启** sidecar。
+///
+/// - 持久化 collection（UI 立刻看到新名称）
+/// - 重写 manifest / config 运行文件（下次启动生效；config 的 api-keys
+///   若 sidecar 配置 watcher 存活会热更新鉴权集合）
+/// - 运行中进程保持不动，避免打断正在代理的请求
+pub async fn apply_client_keys_no_restart(
+    client_keys: Vec<crate::models::codebuddy_local_access::CodebuddyClientKey>,
+) -> Result<CodebuddyLocalAccessState, String> {
+    let mut collection = load_collection();
+    collection.client_keys = client_keys;
+    normalize_collection(&mut collection);
+    save_collection(&collection)?;
+    let running = {
+        let runtime = runtime().lock().await;
+        runtime.running
+    };
+    if running {
+        // 只落盘运行文件，不 stop/start。
+        match write_runtime_files(&collection) {
+            Ok(_) => {
+                logger::log_codex_api_info(&format!(
+                    "[CodebuddyLocalAccess] 客户端密钥已热更新（未重启） count={}",
+                    collection.client_keys.len()
+                ));
+            }
+            Err(error) => {
+                logger::log_codex_api_warn(&format!(
+                    "[CodebuddyLocalAccess] 热更新密钥运行文件失败（名称已保存）: {}",
+                    error
+                ));
+            }
+        }
+    }
+    Ok(service_state().await)
+}
+
 // ── 上游模型目录 + 探测 ────────────────────────────────────────
 //
 // 上游 CLI 暴露的可用模型不在 `/v3/config`（对非 IDE UA 返回 code 12403），
@@ -1058,6 +1337,13 @@ fn is_non_chat_model(id: &str, max_output_tokens: i64, tags: &[String]) -> bool 
         return true;
     }
     tags.iter().any(|tag| tag == "text-to-image")
+}
+
+fn parse_credits_rate(raw: Option<&str>) -> Option<f64> {
+    let s = raw?.trim().to_ascii_lowercase();
+    let s = s.strip_prefix('x').unwrap_or(&s);
+    let s = s.trim_end_matches("credits").trim();
+    s.parse::<f64>().ok()
 }
 
 fn parse_codebuddy_models(payload: &Value) -> Result<(Vec<String>, Vec<CodebuddyModelInfo>), String> {
@@ -1178,6 +1464,24 @@ fn parse_codebuddy_models(payload: &Value) -> Result<(Vec<String>, Vec<Codebuddy
                 .unwrap_or(false),
             efforts,
             description,
+            credits: raw
+                .get("credits")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            credits_rate: parse_credits_rate(raw.get("credits").and_then(Value::as_str)),
+            tags: tags.clone(),
+            vendor: raw
+                .get("vendor")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            is_default: raw.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
+            only_reasoning: raw
+                .get("onlyReasoning")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            max_allowed_size: raw.get("maxAllowedSize").and_then(Value::as_i64).unwrap_or(0),
         });
     }
 
@@ -1270,7 +1574,22 @@ pub async fn fetch_models() -> CodebuddyFetchModelsResult {
                 let count = models.len();
                 for model in models {
                     match merged.iter_mut().find(|existing| existing.id == model.id) {
-                        Some(existing) => existing.cli = existing.cli || model.cli,
+                        Some(existing) => {
+                            existing.cli = existing.cli || model.cli;
+                            if existing.credits.is_none() {
+                                existing.credits = model.credits;
+                                existing.credits_rate = model.credits_rate;
+                            }
+                            if existing.tags.is_empty() {
+                                existing.tags = model.tags;
+                            }
+                            if existing.description.is_none() {
+                                existing.description = model.description;
+                            }
+                            if existing.vendor.is_none() {
+                                existing.vendor = model.vendor;
+                            }
+                        }
                         None => merged.push(model),
                     }
                 }
@@ -1306,12 +1625,230 @@ pub async fn fetch_models() -> CodebuddyFetchModelsResult {
     } else {
         format!("拉取到 {} 个可用模型", cli.len() + rest.len())
     };
+    let catalog: Vec<serde_json::Value> = merged
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "name": m.name,
+                "contextLength": m.context_length,
+                "maxOutputTokens": m.max_output_tokens,
+                "supportsImages": m.supports_images,
+                "supportsReasoning": m.supports_reasoning,
+                "supportsToolCall": m.supports_tool_call,
+                "efforts": m.efforts,
+                "description": m.description,
+                "cli": m.cli,
+                "credits": m.credits,
+                "creditsRate": m.credits_rate,
+                "tags": m.tags,
+                "vendor": m.vendor,
+                "isDefault": m.is_default,
+                "onlyReasoning": m.only_reasoning,
+                "maxAllowedSize": m.max_allowed_size,
+            })
+        })
+        .collect();
+    {
+        let mut collection = load_collection();
+        collection.model_catalog = catalog.clone();
+        // Per-account catalogs for diff / free-binding.
+        let mut per_account: Vec<crate::models::codebuddy_local_access::CodebuddyAccountModelCatalog> =
+            Vec::new();
+        for entry in &collection.accounts {
+            let label = entry
+                .label
+                .clone()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| entry.account_id.clone());
+            if let Ok(models) = fetch_models_for_account(&client, entry).await {
+                let rows: Vec<serde_json::Value> = models
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "id": m.id,
+                            "name": m.name,
+                            "credits": m.credits,
+                            "creditsRate": m.credits_rate,
+                            "tags": m.tags,
+                            "contextLength": m.context_length,
+                            "maxOutputTokens": m.max_output_tokens,
+                            "efforts": m.efforts,
+                            "cli": m.cli,
+                            "description": m.description,
+                        })
+                    })
+                    .collect();
+                per_account.push(crate::models::codebuddy_local_access::CodebuddyAccountModelCatalog {
+                    account_id: entry.account_id.clone(),
+                    platform: Some(entry.platform.as_str().to_string()),
+                    label: Some(label),
+                    models: rows,
+                });
+            }
+        }
+        if !per_account.is_empty() {
+            collection.account_model_catalogs = per_account;
+        }
+        let _ = save_collection(&collection);
+    }
     CodebuddyFetchModelsResult {
         ok,
         message,
         models: cli.into_iter().chain(rest).collect(),
         accounts,
     }
+}
+
+/// Model catalog payload for UI: collection cache + disabled flags + pool/status extras.
+pub async fn model_catalog_payload() -> serde_json::Value {
+    let collection = load_collection();
+    let mut models = collection.model_catalog.clone();
+    if models.is_empty() {
+        for id in current_model_ids(&collection) {
+            models.push(serde_json::json!({ "id": id, "name": id, "cli": true }));
+        }
+    }
+    let disabled: Vec<String> = collection.disabled_models.clone();
+    // Enrich from sidecar /status when running (free/paid + usage + cost explore).
+    let mut runtime = serde_json::Value::Null;
+    if let Ok(status) = fetch_runtime_status().await {
+        if let Some(raw) = status.raw.clone() {
+            runtime = raw;
+        }
+    }
+    serde_json::json!({
+        "models": models,
+        "disabledModels": disabled,
+        "runtime": runtime,
+        "collectionModelIds": collection.model_ids,
+        // Full enterprise rows when available (credits/tags/vendor…).
+        "modelCatalog": collection.model_catalog,
+    })
+}
+
+/// Query sidecar request ledger filtered by API key.
+pub async fn query_runtime_requests_filtered(
+    api_key: Option<String>,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let base_url = {
+        let runtime = runtime().lock().await;
+        if !runtime.running {
+            None
+        } else {
+            runtime.base_url()
+        }
+    };
+    let Some(base_url) = base_url else {
+        return Err("服务未运行，请先启动服务".to_string());
+    };
+    let offset = offset.unwrap_or(0).min(500);
+    let limit = limit.unwrap_or(20).clamp(1, 500);
+    let mut url = format!("{}/v1/codebuddy/requests?offset={}&limit={}", base_url, offset, limit);
+    if let Some(key) = api_key {
+        let key = key.trim();
+        if !key.is_empty() {
+            url.push_str(&format!("&apiKey={}", urlencoding_lite(key)));
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("请求流水失败: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("请求流水接口返回 {}", resp.status()));
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("解析请求流水失败: {}", e))
+}
+
+fn urlencoding_lite(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// API key usage stats from sidecar (running) or empty.
+pub async fn api_key_stats_payload() -> serde_json::Value {
+    let base_url = {
+        let runtime = runtime().lock().await;
+        if runtime.running {
+            runtime.base_url()
+        } else {
+            None
+        }
+    };
+    let Some(base_url) = base_url else {
+        return serde_json::json!({ "apiKeyStats": {}, "clientKeys": load_collection().client_keys });
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok();
+    let mut stats = serde_json::json!({});
+    if let Some(client) = client {
+        if let Ok(resp) = client
+            .get(format!("{}/v1/codebuddy/status", base_url))
+            .send()
+            .await
+        {
+            if let Ok(value) = resp.json::<serde_json::Value>().await {
+                if let Some(obj) = value.get("apiKeyStats") {
+                    stats = obj.clone();
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "apiKeyStats": stats,
+        "clientKeys": load_collection().client_keys,
+        "primaryKeyLabel": "Primary",
+    })
+}
+
+/// Clear sticky session bindings on the running sidecar.
+pub async fn clear_sticky_sessions() -> Result<serde_json::Value, String> {
+    let base_url = {
+        let runtime = runtime().lock().await;
+        if runtime.running {
+            runtime.base_url()
+        } else {
+            None
+        }
+    };
+    let Some(base_url) = base_url else {
+        return Err("服务未运行".to_string());
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+    let resp = client
+        .post(format!("{}/v1/codebuddy/sessions/clear", base_url))
+        .send()
+        .await
+        .map_err(|e| format!("清除会话粘性失败: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("清除会话粘性返回 {}", resp.status()));
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("解析结果失败: {}", e))
 }
 
 /// 经本地服务发起一次真实对话，验证「模型 + 账号」端到端是否可用。
