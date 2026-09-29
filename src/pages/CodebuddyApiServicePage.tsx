@@ -1,5 +1,19 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
-import { Activity, Download, Play, RefreshCw, Square, Wand2, X, Zap } from "lucide-react";
+import { Fragment, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  Activity,
+  Database,
+  Download,
+  KeyRound,
+  LayoutDashboard,
+  ListOrdered,
+  Play,
+  RefreshCw,
+  Square,
+  Users,
+  Wand2,
+  X,
+  Zap,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import * as service from "../services/codebuddyLocalAccessService";
 import {
@@ -16,6 +30,8 @@ import type {
   CodebuddyLocalAccessScope,
   CodebuddyLocalAccessState,
   CodebuddyLocalAccessTestResult,
+  CodebuddyModelCatalogRow,
+  CodebuddyModelGroup,
   CodebuddyModelInfo,
   CodebuddyModelUsageRow,
   CodebuddyProbeResult,
@@ -167,7 +183,7 @@ export function CodebuddyApiServicePage() {
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<CodebuddyLocalAccessTestResult | null>(null);
   const [portDraft, setPortDraft] = useState("");
-  const [copied, setCopied] = useState<"base" | "key" | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
   const [fetchedModels, setFetchedModels] = useState<CodebuddyModelInfo[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelsMessage, setModelsMessage] = useState<string | null>(null);
@@ -179,20 +195,37 @@ export function CodebuddyApiServicePage() {
   const [runtimeStatus, setRuntimeStatus] = useState<CodebuddyRuntimeStatus | null>(null);
   const [runtimeStatusLoading, setRuntimeStatusLoading] = useState(false);
   const [runtimeStatusError, setRuntimeStatusError] = useState<string | null>(null);
-  const [runtimeView, setRuntimeView] = useState<"ledger" | "requests" | "usage">("ledger");
+  const [runtimeView, setRuntimeView] = useState<"pool" | "ledger" | "requests" | "usage">("requests");
+  const [pageTab, setPageTab] = useState<
+    "overview" | "accounts" | "logs" | "models" | "keys" | "help"
+  >("logs");
+  const [modelGroups, setModelGroups] = useState<CodebuddyModelGroup[]>([]);
+  const [logFilterAccount, setLogFilterAccount] = useState("");
+  const [logFilterModel, setLogFilterModel] = useState("");
+  const [logFilterOutcome, setLogFilterOutcome] = useState("");
+  const [coolingRows, setCoolingRows] = useState<
+    Array<{ accountId?: string; accountLabel?: string; model?: string; kind?: string; until?: string; reason?: string }>
+  >([]);
   const [requestPage, setRequestPage] = useState(0);
-  const [requestPageSize, setRequestPageSize] = useState(20);
+  const [requestPageSize, setRequestPageSize] = useState(50);
   const [requestTotal, setRequestTotal] = useState(0);
   const [requestRecords, setRequestRecords] = useState<CodebuddyRequestRecord[]>([]);
   const [requestsLoading, setRequestsLoading] = useState(false);
   const [expandedRequestId, setExpandedRequestId] = useState<string | null>(null);
   const [modelUsage, setModelUsage] = useState<CodebuddyModelUsageRow[]>([]);
+  const [apiKeyStats, setApiKeyStats] = useState<
+    Record<string, { ok?: number; fail?: number; credit?: number; tokens?: number; requests?: number }>
+  >({});
+  const [apiKeyFilter, setApiKeyFilter] = useState<string>("");
 
   const refresh = useCallback(async () => {
     try {
       const next = await service.getCodebuddyLocalAccessState();
       setState(next);
       setPortDraft(String(next.collection.port));
+      if (next.collection.modelGroups) {
+        setModelGroups(next.collection.modelGroups);
+      }
       if (next.lastError) {
         setError(next.lastError);
       }
@@ -203,12 +236,24 @@ export function CodebuddyApiServicePage() {
 
   useEffect(() => {
     void refresh();
+    // Always pull durable logs so cache/requests are visible even before service start.
+    void loadRequestPage(0, 20);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refresh]);
 
   const refreshRuntimeStatus = useCallback(async () => {
     if (!state?.running) {
       setRuntimeStatus(null);
       setRuntimeStatusError(null);
+      // Durable usage view works even when the sidecar is offline.
+      try {
+        const stats = await service.getCodebuddyUsageStats();
+        if (stats.modelUsage?.length) {
+          setModelUsage(stats.modelUsage);
+        }
+      } catch {
+        // ignore — empty usage is acceptable when DB is empty
+      }
       return;
     }
     setRuntimeStatusLoading(true);
@@ -216,8 +261,24 @@ export function CodebuddyApiServicePage() {
     try {
       const next = await service.getCodebuddyRuntimeStatus();
       setRuntimeStatus(next);
+      if (Array.isArray((next as { cooling?: unknown }).cooling)) {
+        setCoolingRows(
+          (next as { cooling?: Array<{ accountId?: string; accountLabel?: string; model?: string; kind?: string; until?: string; reason?: string }> }).cooling ?? [],
+        );
+      }
       if (next.modelUsage) {
-        setModelUsage(next.modelUsage);
+        setModelUsage(next.modelUsage as CodebuddyModelUsageRow[]);
+      }
+      if (next.apiKeyStats) {
+        setApiKeyStats(next.apiKeyStats);
+      }
+      try {
+        const stats = await service.getCodebuddyUsageStats();
+        if (stats.modelUsage?.length) {
+          setModelUsage(stats.modelUsage);
+        }
+      } catch {
+        // durable store optional enrichment
       }
     } catch (err) {
       setRuntimeStatusError(err instanceof Error ? err.message : String(err));
@@ -227,21 +288,43 @@ export function CodebuddyApiServicePage() {
   }, [state?.running]);
 
   const loadRequestPage = useCallback(
-    async (page: number, pageSize: number) => {
-      if (!state?.running) {
-        setRequestRecords([]);
-        setRequestTotal(0);
-        return;
-      }
+    async (page: number, pageSize: number, apiKey?: string) => {
       setRequestsLoading(true);
       setRuntimeStatusError(null);
       try {
         const offset = Math.max(0, page) * pageSize;
-        const result = await service.getCodebuddyRuntimeRequests(offset, pageSize);
+        const key = (apiKey ?? apiKeyFilter) || null;
+        // Always prefer SQLite full history (not the 500-row sidecar ring).
+        let result: {
+          records: CodebuddyRequestRecord[];
+          total: number;
+          modelUsage?: CodebuddyModelUsageRow[];
+        };
+        if (key && state?.running) {
+          // Live filter by API key from sidecar when service is up.
+          try {
+            const live = await service.getCodebuddyRequestLogsByKey(key, offset, pageSize);
+            result = {
+              records: (live.records ?? []) as unknown as CodebuddyRequestRecord[],
+              total: live.total ?? 0,
+              modelUsage: live.modelUsage as unknown as CodebuddyModelUsageRow[] | undefined,
+            };
+            if (live.apiKeyStats) {
+              setApiKeyStats(live.apiKeyStats as Record<string, { ok?: number; fail?: number; credit?: number; tokens?: number; requests?: number }>);
+            }
+          } catch {
+            result = await service.getCodebuddyRequestLogs(offset, pageSize);
+          }
+        } else {
+          result = await service.getCodebuddyRequestLogs(offset, pageSize);
+        }
         setRequestRecords(result.records ?? []);
         setRequestTotal(result.total ?? 0);
-        if (result.modelUsage) {
+        if (result.modelUsage?.length) {
           setModelUsage(result.modelUsage);
+        } else {
+          const stats = await service.getCodebuddyUsageStats();
+          setModelUsage(stats.modelUsage ?? []);
         }
         setRequestPage(page);
         setRequestPageSize(pageSize);
@@ -251,7 +334,7 @@ export function CodebuddyApiServicePage() {
         setRequestsLoading(false);
       }
     },
-    [state?.running],
+    [apiKeyFilter, state?.running],
   );
 
   useEffect(() => {
@@ -263,10 +346,12 @@ export function CodebuddyApiServicePage() {
   }, [state?.running, refreshRuntimeStatus]);
 
   useEffect(() => {
-    if (runtimeView === "requests" && state?.running) {
+    if (runtimeView === "requests" || runtimeView === "usage") {
       void loadRequestPage(0, requestPageSize);
+    } else {
+      void refreshRuntimeStatus();
     }
-  }, [runtimeView, state?.running, loadRequestPage, requestPageSize]);
+  }, [runtimeView, loadRequestPage, requestPageSize, refreshRuntimeStatus]);
 
   const run = useCallback(
     async (action: () => Promise<CodebuddyLocalAccessState>) => {
@@ -464,7 +549,7 @@ export function CodebuddyApiServicePage() {
     );
   };
 
-  const copy = async (kind: "base" | "key", value: string) => {
+  const copy = async (kind: string, value: string) => {
     try {
       await navigator.clipboard.writeText(value);
       setCopied(kind);
@@ -608,105 +693,858 @@ export function CodebuddyApiServicePage() {
 
       {error ? <div className="cblas-error">{error}</div> : null}
 
-      <section className="cblas-card">
+      <nav className="cblas-page-tabs" aria-label="API 服务功能区">
+        {(
+          [
+            ["overview", "服务概览", <LayoutDashboard key="i" size={14} />],
+            ["accounts", "账号池", <Users key="i" size={14} />],
+            ["logs", "流水统计", <Activity key="i" size={14} />],
+            ["models", "模型目录", <Database key="i" size={14} />],
+            ["keys", "API 密钥", <KeyRound key="i" size={14} />],
+            ["help", "接入说明", <ListOrdered key="i" size={14} />],
+          ] as const
+        ).map(([id, label, icon]) => (
+          <button
+            key={id}
+            type="button"
+            className={`cblas-page-tab ${pageTab === id ? "active" : ""}`}
+            onClick={() => {
+              setPageTab(id);
+              if (id === "logs") {
+                void refreshRuntimeStatus();
+                void loadRequestPage(requestPage || 0, requestPageSize);
+              }
+            }}
+          >
+            {icon}
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      <div className="cblas-page-tab-body">
+      {pageTab === "overview" ? (
+        (() => {
+          const usageTotals = modelUsage.reduce(
+            (acc, row) => {
+              acc.req += row.requests || 0;
+              acc.input += row.totalInput || 0;
+              acc.cache += row.cacheRead || 0;
+              acc.write += row.cacheWrite || 0;
+              acc.tokens += row.totalTokens || 0;
+              acc.credit += row.credit || 0;
+              return acc;
+            },
+            { req: 0, input: 0, cache: 0, write: 0, tokens: 0, credit: 0 },
+          );
+          const hitPct =
+            usageTotals.input > 0 ? (usageTotals.cache / usageTotals.input) * 100 : null;
+          const kpi = (
+            label: string,
+            value: ReactNode,
+            foot: string,
+            tone: "ok" | "warn" | "danger" | "info" | "muted" = "info",
+            icon?: ReactNode,
+          ) => (
+            <div className={`cblas-kpi-card ${tone !== "info" ? `is-${tone}` : ""}`}>
+              <div className="cblas-kpi-head">
+                <span className="cblas-kpi-label">{label}</span>
+                {icon ? <span className="cblas-kpi-icon">{icon}</span> : null}
+              </div>
+              <div className={`cblas-kpi-value ${typeof value === "string" && value.length > 12 ? "mono" : ""}`}>
+                {value}
+              </div>
+              {foot ? <div className="cblas-kpi-foot">{foot}</div> : null}
+            </div>
+          );
+          return (
+            <>
+              <div className="cblas-kpi-grid cblas-kpi-grid--wide">
+                {kpi(
+                  "服务状态",
+                  state?.running ? "运行中" : "已停止",
+                  state?.running ? `端口 ${collection?.port ?? "—"}` : "启动后可代理 /v1",
+                  state?.running ? "ok" : "danger",
+                  <Play size={14} />,
+                )}
+                {kpi(
+                  "Base URL",
+                  state?.baseUrl || "未启动",
+                  state?.lanBaseUrl ? "已配置局域网地址" : "默认仅本机",
+                  state?.baseUrl ? "info" : "muted",
+                  <Zap size={14} />,
+                )}
+                {kpi(
+                  "启用账号",
+                  `${selectedRefs.length}/${flatAccounts.length}`,
+                  `模型组 ${(collection?.modelGroups ?? []).length} · 密钥 ${(collection?.clientKeys ?? []).length + 1}`,
+                  selectedRefs.length > 0 ? "ok" : "warn",
+                  <Users size={14} />,
+                )}
+                {kpi(
+                  "可用模型",
+                  String((state?.modelIds ?? []).length),
+                  `禁用 ${(collection?.disabledModels ?? []).length} · 目录 ${(runtimeStatus?.catalog ?? []).length || (state?.modelIds ?? []).length}`,
+                  "info",
+                  <Database size={14} />,
+                )}
+                {kpi(
+                  "流水条数",
+                  String(requestTotal || usageTotals.req),
+                  "SQLite 持久化 · 重启不丢",
+                  (requestTotal || usageTotals.req) > 0 ? "ok" : "muted",
+                  <Activity size={14} />,
+                )}
+                {kpi(
+                  "缓存命中率",
+                  hitPct == null ? "—" : `${hitPct >= 99.5 ? "99+" : Math.round(hitPct)}%`,
+                  `缓存读 ${formatTokenCount(usageTotals.cache)} / 写 ${formatTokenCount(usageTotals.write)}`,
+                  hitPct != null && hitPct >= 40 ? "ok" : hitPct != null && hitPct > 0 ? "warn" : "muted",
+                  <Activity size={14} />,
+                )}
+                {kpi(
+                  "Token / Credit",
+                  formatTokenCount(usageTotals.tokens),
+                  `累计 credit ${formatCredit(usageTotals.credit)}`,
+                  "info",
+                  <ListOrdered size={14} />,
+                )}
+                {kpi(
+                  "提示词 / 粘性",
+                  runtimeStatus?.promptMode || "passthrough",
+                  `会话粘性 ${runtimeStatus?.sessionAffinityCount ?? 0} · 同会话钉号吃缓存`,
+                  "muted",
+                  <Wand2 size={14} />,
+                )}
+              </div>
+
+              {(() => {
+                if (hitPct == null) return null;
+                return (
+                  <div className="cblas-card" style={{ marginTop: 4 }}>
+                    <div className="cblas-card-head">
+                      <h3>Prompt Cache</h3>
+                      <span className="cblas-badge cblas-badge--on">
+                        {hitPct >= 99.5 ? "99+" : Math.round(hitPct)}%
+                      </span>
+                    </div>
+                    <div className="cblas-cache-bar" title={`cacheRead=${usageTotals.cache} totalInput=${usageTotals.input}`}>
+                      <i style={{ width: `${Math.min(100, Math.max(0, hitPct))}%` }} />
+                    </div>
+                    <div className="cblas-kpi-foot" style={{ marginTop: 8 }}>
+                      命中率高说明同会话粘性生效、上游前缀缓存吃到了；突然掉到 0 多半是换号或清了上下文。
+                    </div>
+                  </div>
+                );
+              })()}
+            </>
+          );
+        })()
+      ) : null}
+
+      <section className="cblas-card" hidden={pageTab !== "keys"}>
         <div className="cblas-card-head">
-          <h3>
-            <Activity size={14} style={{ marginRight: 6, verticalAlign: "middle" }} />
-            请求与限流台账
-          </h3>
+          <h3>API 密钥</h3>
           <div className="cblas-row" style={{ marginBottom: 0 }}>
             <button
               type="button"
-              className={`cblas-button ${runtimeView === "ledger" ? "cblas-button--primary" : ""}`}
-              onClick={() => setRuntimeView("ledger")}
-            >
-              限流冷却
-            </button>
-            <button
-              type="button"
-              className={`cblas-button ${runtimeView === "requests" ? "cblas-button--primary" : ""}`}
-              onClick={() => setRuntimeView("requests")}
-            >
-              请求流水
-            </button>
-            <button
-              type="button"
-              className={`cblas-button ${runtimeView === "usage" ? "cblas-button--primary" : ""}`}
+              className="cblas-button"
+              disabled={!state?.running}
               onClick={() => {
-                setRuntimeView("usage");
-                void refreshRuntimeStatus();
+                void run(async () => {
+                  const r = await service.clearCodebuddyStickySessions();
+                  setModelsMessage(`已清除 ${r.cleared ?? 0} 条会话粘性`);
+                  await refreshRuntimeStatus();
+                  return await service.getCodebuddyLocalAccessState();
+                });
               }}
             >
-              用量统计
+              清除会话粘性
+            </button>
+            <button
+              type="button"
+              className="cblas-button cblas-button--primary"
+              disabled={busy}
+              onClick={() => {
+                const next = [
+                  ...(collection?.clientKeys ?? []),
+                  {
+                    id: `key_${Date.now()}`,
+                    label: `Key ${(collection?.clientKeys?.length ?? 0) + 1}`,
+                    key: `cbk-${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 10)}`,
+                    enabled: true,
+                    modelGroupId: null,
+                  },
+                ];
+                void run(() => service.saveCodebuddyApiKeys(next));
+              }}
+            >
+              新增密钥
+            </button>
+          </div>
+        </div>
+          <p className="cblas-note">
+            所有密钥地位相同，不再区分主密钥/附加密钥。可为每个密钥绑定「模型分组」，只路由到分组内账号（及分组模型白名单）。
+          </p>
+          <table className="cblas-table cblas-key-stats">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>密钥</th>
+                <th>启用</th>
+                <th>绑定模型分组</th>
+                <th>调用</th>
+                <th>Credit</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(collection?.clientKeys ?? collection?.apiKey
+                ? [
+                    ...(collection?.apiKey
+                      ? [
+                          {
+                            id: "default",
+                            label: "默认",
+                            key: collection?.apiKey ?? "",
+                            enabled: true,
+                            modelGroupId: null as string | null,
+                          },
+                        ]
+                      : []),
+                    ...(collection?.clientKeys ?? []),
+                  ]
+                : []
+              ).map((item, index) => {
+                const st =
+                  apiKeyStats[item.id] ||
+                  apiKeyStats[item.label] ||
+                  Object.entries(apiKeyStats).find(
+                    ([k]) => k.includes(item.id) || (item.label && k.includes(item.label)),
+                  )?.[1] ||
+                  {};
+                return (
+                  <tr key={item.id || index}>
+                    <td>
+                      <input
+                        className="cblas-input"
+                        style={{ width: 100 }}
+                        value={item.label}
+                        onChange={(e) => {
+                          const list = [...(collection?.clientKeys ?? [])];
+                          const i = list.findIndex((k) => k.id === item.id);
+                          if (i >= 0) {
+                            list[i] = { ...list[i], label: e.target.value };
+                            void run(() => service.saveCodebuddyApiKeys(list));
+                          }
+                        }}
+                      />
+                    </td>
+                    <td className="cblas-mono">{item.key}</td>
+                    <td>
+                      <input
+                        type="checkbox"
+                        checked={item.enabled}
+                        onChange={(e) => {
+                          const list = [...(collection?.clientKeys ?? [])];
+                          const i = list.findIndex((k) => k.id === item.id);
+                          if (i >= 0) {
+                            list[i] = { ...list[i], enabled: e.target.checked };
+                            void run(() => service.saveCodebuddyApiKeys(list));
+                          }
+                        }}
+                      />
+                    </td>
+                    <td>
+                      <select
+                        className="cblas-select"
+                        style={{ minWidth: 140 }}
+                        value={item.modelGroupId ?? ""}
+                        onChange={(e) => {
+                          const list = [...(collection?.clientKeys ?? [])];
+                          const i = list.findIndex((k) => k.id === item.id);
+                          if (i >= 0) {
+                            list[i] = {
+                              ...list[i],
+                              modelGroupId: e.target.value || null,
+                            };
+                            void run(() => service.saveCodebuddyApiKeys(list));
+                          }
+                        }}
+                      >
+                        <option value="">全部账号</option>
+                        {modelGroups.map((g) => (
+                          <option key={g.id} value={g.id}>
+                            {g.name}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td>{st.requests ?? "—"}</td>
+                    <td>{formatCredit(st.credit)}</td>
+                    <td className="row-actions">
+                      <button
+                        type="button"
+                        className="cblas-button"
+                        onClick={() => void copy(`k-${item.id}`, item.key)}
+                      >
+                        {copied === `k-${item.id}` ? "已复制" : "复制"}
+                      </button>
+                      {item.id !== "default" ? (
+                        <button
+                          type="button"
+                          className="cblas-button"
+                          onClick={() => {
+                            const list = (collection?.clientKeys ?? []).filter(
+                              (k) => k.id !== item.id,
+                            );
+                            void run(() => service.saveCodebuddyApiKeys(list));
+                          }}
+                        >
+                          删除
+                        </button>
+                      ) : null}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </section>
+
+      {pageTab === "models" ? (
+        <section className="cblas-card">
+          <div className="cblas-card-head">
+            <h3>模型分组（按账号组成，供密钥绑定）</h3>
+            <button
+              type="button"
+              className="cblas-button cblas-button--primary"
+              disabled={busy}
+              onClick={() => {
+                const g: CodebuddyModelGroup = {
+                  id: `grp_${Date.now()}`,
+                  name: `分组 ${modelGroups.length + 1}`,
+                  accountIds: [],
+                  modelIds: [],
+                  kind: "custom",
+                };
+                const next = [...modelGroups, g];
+                setModelGroups(next);
+                void run(() => service.setCodebuddyModelGroups(next));
+              }}
+            >
+              新增分组
+            </button>
+          </div>
+          <p className="cblas-note">
+            建议：先「拉取企业模型（按号）」，再按某号 hy4-preview 全天免费等差异，把账号加入「免费分组 / 付费分组」，密钥绑定分组即可分流。
+          </p>
+          {modelGroups.map((g, gi) => (
+            <div className="cblas-model-row" key={g.id}>
+              <div className="cblas-row">
+                <input
+                  className="cblas-input"
+                  style={{ width: 160 }}
+                  value={g.name}
+                  onChange={(e) => {
+                    const next = [...modelGroups];
+                    next[gi] = { ...g, name: e.target.value };
+                    setModelGroups(next);
+                  }}
+                  onBlur={() => void run(() => service.setCodebuddyModelGroups(modelGroups))}
+                />
+                <select
+                  className="cblas-select"
+                  value={g.kind ?? "custom"}
+                  onChange={(e) => {
+                    const next = [...modelGroups];
+                    next[gi] = { ...g, kind: e.target.value };
+                    setModelGroups(next);
+                    void run(() => service.setCodebuddyModelGroups(next));
+                  }}
+                >
+                  <option value="free">免费</option>
+                  <option value="paid">付费</option>
+                  <option value="custom">自定义</option>
+                </select>
+                <button
+                  type="button"
+                  className="cblas-button"
+                  onClick={() => {
+                    const next = modelGroups.filter((x) => x.id !== g.id);
+                    setModelGroups(next);
+                    void run(() => service.setCodebuddyModelGroups(next));
+                  }}
+                >
+                  删除分组
+                </button>
+              </div>
+              <div className="cblas-row" style={{ alignItems: "flex-start" }}>
+                <span className="cblas-label">账号</span>
+                <div style={{ flex: 1, display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {(state?.availableAccounts ?? []).map((acc) => {
+                    const key = acc.accountId;
+                    const on = (g.accountIds ?? []).includes(key);
+                    return (
+                      <label key={`${acc.platform}:${acc.accountId}`} style={{ fontSize: 12 }}>
+                        <input
+                          type="checkbox"
+                          checked={on}
+                          onChange={(e) => {
+                            const set = new Set(g.accountIds ?? []);
+                            if (e.target.checked) {
+                              set.add(key);
+                            } else {
+                              set.delete(key);
+                            }
+                            const next = [...modelGroups];
+                            next[gi] = { ...g, accountIds: Array.from(set) };
+                            setModelGroups(next);
+                            void run(() => service.setCodebuddyModelGroups(next));
+                          }}
+                        />{" "}
+                        {acc.label || acc.accountId}
+                        {acc.creditsRemain != null ? ` (${acc.creditsRemain})` : ""}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="cblas-row" style={{ alignItems: "flex-start" }}>
+                <span className="cblas-label">模型白名单</span>
+                <input
+                  className="cblas-input"
+                  style={{ flex: 1, minWidth: 200 }}
+                  placeholder="留空=分组内账号全部模型；可填 hy4-preview,glm-5.2"
+                  value={(g.modelIds ?? []).join(",")}
+                  onChange={(e) => {
+                    const list = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
+                    const next = [...modelGroups];
+                    next[gi] = { ...g, modelIds: list };
+                    setModelGroups(next);
+                  }}
+                  onBlur={() => void run(() => service.setCodebuddyModelGroups(modelGroups))}
+                />
+              </div>
+            </div>
+          ))}
+          <div className="cblas-row" style={{ marginTop: 10 }}>
+            <button
+              type="button"
+              className="cblas-button"
+              disabled={busy}
+              onClick={() => void run(() => service.setCodebuddyModelGroups(modelGroups))}
+            >
+              保存全部分组
             </button>
             <button
               type="button"
               className="cblas-button"
-              onClick={() => {
-                if (runtimeView === "requests") {
-                  void loadRequestPage(requestPage, requestPageSize);
-                } else {
-                  void refreshRuntimeStatus();
-                }
-              }}
-              disabled={
-                (runtimeView === "requests" ? requestsLoading : runtimeStatusLoading) ||
-                !state?.running
-              }
+              disabled={fetchingModels || selectedRefs.length === 0}
+              onClick={() => void handleFetchModels()}
             >
-              <RefreshCw
-                size={14}
-                className={
-                  runtimeView === "requests"
-                    ? requestsLoading
-                      ? "loading-spinner"
-                      : ""
-                    : runtimeStatusLoading
-                      ? "loading-spinner"
-                      : ""
-                }
-              />
-              <span style={{ marginLeft: 6 }}>刷新</span>
+              <Download size={14} />
+              <span style={{ marginLeft: 6 }}>拉取企业模型（按号）</span>
             </button>
           </div>
+          {(runtimeStatus as { accountCatalogs?: Array<{ accountId: string; label?: string; credits?: Record<string, string>; alwaysFreeModels?: string[]; nightOnlyFreeModels?: string[]; models?: Array<{ id?: string }> }> })
+            ?.accountCatalogs?.length ? (
+            <div className="cblas-model-table" style={{ marginTop: 12 }}>
+              <h3 style={{ margin: "0 0 8px", fontSize: 13 }}>按号模型目录（差异对照）</h3>
+              {(
+                runtimeStatus as {
+                  accountCatalogs: Array<{
+                    accountId: string;
+                    label?: string;
+                    credits?: Record<string, string>;
+                    alwaysFreeModels?: string[];
+                    nightOnlyFreeModels?: string[];
+                    models?: Array<{ id?: string; credits?: string }>;
+                  }>;
+                }
+              ).accountCatalogs!.map((acc) => (
+                <div className="cblas-model-row" key={acc.accountId}>
+                  <div className="cblas-model-main">
+                    <span className="cblas-model-id">{acc.label || acc.accountId}</span>
+                    {acc.alwaysFreeModels?.length ? (
+                      <span className="cblas-model-tag is-free">
+                        全天免费 {acc.alwaysFreeModels.join("/")}
+                      </span>
+                    ) : null}
+                    {acc.nightOnlyFreeModels?.length ? (
+                      <span className="cblas-model-tag is-paid">
+                        仅夜间 {acc.nightOnlyFreeModels.join("/")}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="cblas-model-meta">
+                    {(acc.models ?? []).slice(0, 24).map((m) => {
+                      const id = m.id ?? "";
+                      const credits = acc.credits?.[id] || (m as { credits?: string }).credits || "—";
+                      const always = (acc.alwaysFreeModels ?? []).includes(id);
+                      return (
+                        <span key={id} className="cblas-model-tag" style={{ marginRight: 4 }}>
+                          {id}:{credits}
+                          {always ? "·免费号" : ""}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+
+      <section className="cblas-card cblas-logs-card" hidden={pageTab !== "logs"}>
+        <div className="cblas-card-head cblas-logs-head">
+          <div>
+            <h3>
+              <Activity size={14} style={{ marginRight: 6, verticalAlign: "middle" }} />
+              流水统计
+            </h3>
+            <div className="cblas-kpi-foot" style={{ marginTop: 4 }}>
+              数据源：本地 SQLite（服务重启仍在） · 可判断是否吃到 prompt cache
+            </div>
+          </div>
+          <button
+            type="button"
+            className="cblas-button"
+            onClick={() => {
+              void loadRequestPage(0, requestPageSize);
+              void refreshRuntimeStatus();
+            }}
+            disabled={requestsLoading}
+          >
+            <RefreshCw size={14} className={requestsLoading ? "loading-spinner" : ""} />
+            <span style={{ marginLeft: 6 }}>刷新</span>
+          </button>
         </div>
-        {!state?.running ? (
-          <p className="cblas-empty">服务未运行。启动后可查看 6004 模型冷却与请求流水。</p>
+
+        {(() => {
+          const totals = modelUsage.reduce(
+            (acc, row) => {
+              acc.req += row.requests || 0;
+              acc.input += row.totalInput || 0;
+              acc.cache += row.cacheRead || 0;
+              acc.write += row.cacheWrite || 0;
+              acc.out += row.outputTokens || 0;
+              acc.credit += row.credit || 0;
+              return acc;
+            },
+            { req: 0, input: 0, cache: 0, write: 0, out: 0, credit: 0 },
+          );
+          const hitPct = totals.input > 0 ? (totals.cache / totals.input) * 100 : null;
+          const tone = (v: "ok" | "warn" | "danger" | "info" | "muted") => (v === "info" ? "" : ` is-${v}`);
+          return (
+            <>
+              <div className="cblas-kpi-grid cblas-kpi-grid--wide">
+                <div className={`cblas-kpi-card${tone((requestTotal || totals.req) > 0 ? "ok" : "muted")}`}>
+                  <div className="cblas-kpi-head">
+                    <span className="cblas-kpi-label">流水条数</span>
+                    <span className="cblas-kpi-icon"><Activity size={14} /></span>
+                  </div>
+                  <div className="cblas-kpi-value">{requestTotal || totals.req || 0}</div>
+                  <div className="cblas-kpi-foot">SQLite 持久化</div>
+                </div>
+                <div className={`cblas-kpi-card${tone(hitPct != null && hitPct >= 40 ? "ok" : hitPct != null && hitPct > 0 ? "warn" : "muted")}`}>
+                  <div className="cblas-kpi-head">
+                    <span className="cblas-kpi-label">缓存命中率</span>
+                    <span className="cblas-kpi-icon"><Zap size={14} /></span>
+                  </div>
+                  <div className="cblas-kpi-value">
+                    {hitPct == null ? "—" : `${hitPct >= 99.5 ? "99+" : Math.round(hitPct)}%`}
+                  </div>
+                  <div className="cblas-cache-bar">
+                    <i style={{ width: `${hitPct == null ? 0 : Math.min(100, Math.max(0, hitPct))}%` }} />
+                  </div>
+                </div>
+                <div className="cblas-kpi-card">
+                  <div className="cblas-kpi-head">
+                    <span className="cblas-kpi-label">缓存读 / 写</span>
+                    <span className="cblas-kpi-icon"><Database size={14} /></span>
+                  </div>
+                  <div className="cblas-kpi-value" style={{ fontSize: 18 }}>
+                    {formatTokenCount(totals.cache)} / {formatTokenCount(totals.write)}
+                  </div>
+                  <div className="cblas-kpi-foot">读&gt;0 说明吃到了前缀缓存</div>
+                </div>
+                <div className="cblas-kpi-card">
+                  <div className="cblas-kpi-head">
+                    <span className="cblas-kpi-label">输入 / 输出</span>
+                    <span className="cblas-kpi-icon"><ListOrdered size={14} /></span>
+                  </div>
+                  <div className="cblas-kpi-value" style={{ fontSize: 18 }}>
+                    {formatTokenCount(totals.input)} / {formatTokenCount(totals.out)}
+                  </div>
+                  <div className="cblas-kpi-foot">总输入含缓存读</div>
+                </div>
+                <div className="cblas-kpi-card">
+                  <div className="cblas-kpi-head">
+                    <span className="cblas-kpi-label">累计 Credit</span>
+                    <span className="cblas-kpi-icon"><Zap size={14} /></span>
+                  </div>
+                  <div className="cblas-kpi-value">{formatCredit(totals.credit)}</div>
+                  <div className="cblas-kpi-foot">来自 usage.credit</div>
+                </div>
+                <div className={`cblas-kpi-card${tone(state?.running ? "ok" : "muted")}`}>
+                  <div className="cblas-kpi-head">
+                    <span className="cblas-kpi-label">会话粘性</span>
+                    <span className="cblas-kpi-icon"><Users size={14} /></span>
+                  </div>
+                  <div className="cblas-kpi-value">{runtimeStatus?.sessionAffinityCount ?? 0}</div>
+                  <div className="cblas-kpi-foot">同会话钉号，利于缓存</div>
+                </div>
+              </div>
+              <div className="cblas-logs-toolbar">
+                {(
+                  [
+                    ["requests", "请求流水"],
+                    ["usage", "用量统计"],
+                    ["pool", "选号池"],
+                    ["ledger", "限流冷却"],
+                  ] as const
+                ).map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className={`cblas-button ${runtimeView === id ? "cblas-button--primary" : ""}`}
+                    onClick={() => {
+                      setRuntimeView(id);
+                      if (id === "requests" || id === "usage") {
+                        void loadRequestPage(0, requestPageSize);
+                      } else {
+                        void refreshRuntimeStatus();
+                      }
+                    }}
+                    disabled={id === "pool" || id === "ledger" ? runtimeStatusLoading || requestsLoading : requestsLoading}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {runtimeView === "requests" ? (
+                <div className="cblas-logs-toolbar" style={{ marginTop: 4 }}>
+                  <input
+                    className="cblas-input"
+                    placeholder="账号筛选"
+                    style={{ width: 120 }}
+                    value={logFilterAccount}
+                    onChange={(e) => setLogFilterAccount(e.target.value.trim())}
+                  />
+                  <input
+                    className="cblas-input"
+                    placeholder="模型筛选"
+                    style={{ width: 130 }}
+                    value={logFilterModel}
+                    onChange={(e) => setLogFilterModel(e.target.value.trim())}
+                  />
+                  <select
+                    className="cblas-select"
+                    style={{ width: 120 }}
+                    value={logFilterOutcome}
+                    onChange={(e) => setLogFilterOutcome(e.target.value)}
+                  >
+                    <option value="">全部结果</option>
+                    <option value="ok">成功</option>
+                    <option value="cooling">冷却</option>
+                    <option value="rate_limited">限流</option>
+                    <option value="client_aborted">中断</option>
+                    <option value="error">失败</option>
+                  </select>
+                  <button
+                    type="button"
+                    className="cblas-button"
+                    onClick={() => void loadRequestPage(0, requestPageSize)}
+                  >
+                    应用筛选
+                  </button>
+                  <span className="cblas-kpi-foot">最近在最上 · 全库可筛</span>
+                </div>
+              ) : null}
+            </>
+          );
+        })()}
+        {!state?.running && (runtimeView === "pool" || runtimeView === "ledger") ? (
+          <p className="cblas-empty">
+            服务未运行时仍可查看「请求流水 / 用量统计」（本地 SQLite）。选号池与冷却台账需启动服务。
+          </p>
         ) : runtimeStatusError ? (
           <div className="cblas-error">{runtimeStatusError}</div>
+        ) : runtimeView === "pool" ? (
+          <div className="cblas-pool">
+            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
+              选号池：三因子权重 · costTier 免费优先 · 在途租约 · WAF/降级冷却
+              {runtimeStatus?.pool && (runtimeStatus.pool as { wafIpActive?: boolean }).wafIpActive
+                ? " · **WAF IP 拦截中（轮转 fail-fast）**"
+                : ""}
+            </div>
+            {(() => {
+              const pool = runtimeStatus?.pool as
+                | {
+                    accounts?: Array<{
+                      id: string;
+                      label?: string;
+                      realm?: string;
+                      credits?: number;
+                      creditsExpiring?: number;
+                      creditsKnown?: boolean;
+                      inFlight?: number;
+                      maxInFlight?: number;
+                      weight?: number;
+                      disabled?: boolean;
+                      disableReason?: string;
+                      wafUntil?: string | null;
+                      degradeUntil?: string | null;
+                      alwaysFreeModels?: string[];
+                      nightOnlyFreeModels?: string[];
+                      modelCosts?: Record<
+                        string,
+                        { costPer1k?: number; tier?: number; samples?: number }
+                      >;
+                    }>;
+                    costExploreEvents?: number;
+                  }
+                | undefined;
+              const accounts = pool?.accounts ?? [];
+              if (!state?.running) {
+                return <p className="cblas-empty">启动服务后可查看实时池状态。</p>;
+              }
+              if (accounts.length === 0) {
+                return <p className="cblas-empty">池中暂无账号运行态（成功请求后会开始学习成本）。</p>;
+              }
+              return (
+                <>
+                  <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
+                    cost explore 事件：{pool?.costExploreEvents ?? 0}
+                  </div>
+                  <table className="cblas-table">
+                    <thead>
+                      <tr>
+                        <th>账号</th>
+                        <th>域</th>
+                        <th>积分</th>
+                        <th>权重</th>
+                        <th>在途</th>
+                        <th>状态</th>
+                        <th>模型成本</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {accounts.map((acc) => {
+                        const costs = Object.entries(acc.modelCosts ?? {}).map(([m, c]) => {
+                          const tier =
+                            c.tier === 0 ? "免费" : c.tier === 2 ? "收费" : "未知";
+                          return `${m}:${tier}(${formatCredit(c.costPer1k)})`;
+                        });
+                        const status = acc.disabled
+                          ? `禁用 ${acc.disableReason || ""}`
+                          : acc.wafUntil
+                            ? `WAF冷却至 ${formatTs(acc.wafUntil)}`
+                            : acc.degradeUntil
+                              ? `降权至 ${formatTs(acc.degradeUntil)}`
+                              : "可用";
+                        return (
+                          <tr key={acc.id}>
+                            <td>
+                        {acc.label || acc.id}
+                        {acc.alwaysFreeModels?.length ? (
+                          <div style={{ fontSize: 11 }}>
+                            <span className="cblas-model-tag is-free">
+                              全天免费 {acc.alwaysFreeModels.join("/")}
+                            </span>
+                          </div>
+                        ) : null}
+                        {acc.nightOnlyFreeModels?.length ? (
+                          <div style={{ fontSize: 11 }}>
+                            <span className="cblas-model-tag is-paid">
+                              仅夜间 {acc.nightOnlyFreeModels.join("/")}
+                            </span>
+                          </div>
+                        ) : null}
+                      </td>
+                            <td>{acc.realm || "—"}</td>
+                            <td>
+                              {acc.creditsKnown ? acc.credits : "—"}
+                              {acc.creditsExpiring ? ` / 快过期 ${acc.creditsExpiring}` : ""}
+                            </td>
+                            <td>{formatCredit(acc.weight)}</td>
+                            <td>
+                              {acc.inFlight ?? 0}/{acc.maxInFlight ?? 2}
+                            </td>
+                            <td>{status}</td>
+                            <td className="cblas-mono" style={{ fontSize: 11 }}>
+                              {costs.length ? costs.join(" · ") : "待实测"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </>
+              );
+            })()}
+          </div>
         ) : runtimeView === "ledger" ? (
           <div>
-            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
-              提示词模式：{runtimeStatus?.promptMode || "passthrough"} · 6004 仅冷却触发模型，切换其他模型立即可用
+            <div className="cblas-kpi-foot" style={{ marginBottom: 8 }}>
+              冷却中的账号/模型与截止时间（到点自动恢复；冷却中会换号，全冷却则拦截不打上游）
             </div>
-            {(runtimeStatus?.rateLimitedModels ?? []).length === 0 ? (
-              <p className="cblas-empty">当前没有模型级限流冷却。</p>
+            {coolingRows.length === 0 && (runtimeStatus?.rateLimitedModels ?? []).length === 0 ? (
+              <p className="cblas-empty">当前没有冷却中的账号/模型。</p>
             ) : (
               <table className="cblas-table">
                 <thead>
                   <tr>
                     <th>账号</th>
                     <th>模型</th>
+                    <th>类型</th>
                     <th>冷却至</th>
-                    <th>上游重置</th>
                     <th>原因</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {(runtimeStatus?.rateLimitedModels ?? []).map((item, index) => (
-                    <tr key={`${item.accountId || item.id}-${item.model}-${index}`}>
-                      <td>{item.accountLabel || item.accountId || item.id || "—"}</td>
-                      <td>
-                        <span className="cblas-mono">{item.model}</span>
-                      </td>
+                  {coolingRows.map((item, index) => (
+                    <tr key={`${item.accountId}-${item.model}-${index}`}>
+                      <td>{item.accountLabel || item.accountId || "—"}</td>
+                      <td className="cblas-mono">{item.model || "—"}</td>
+                      <td>{item.kind || "—"}</td>
                       <td>{formatTs(item.until)}</td>
-                      <td>{formatTs(item.resetAt)}</td>
-                      <td>{item.reason || "6004 model rate limit"}</td>
+                      <td>{item.reason || "—"}</td>
+                    </tr>
+                  ))}
+                  {(runtimeStatus?.rateLimitedModels ?? []).map((item, index) => (
+                    <tr key={`rl-${item.accountId || item.id}-${item.model}-${index}`}>
+                      <td>{item.accountLabel || item.accountId || item.id || "—"}</td>
+                      <td className="cblas-mono">{item.model}</td>
+                      <td>model</td>
+                      <td>{formatTs(item.until)}</td>
+                      <td>{item.reason || "6004"}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             )}
+            <div className="cblas-row" style={{ marginTop: 12 }}>
+              <button
+                type="button"
+                className="cblas-button"
+                disabled={!state?.running}
+                onClick={() => {
+                  void run(async () => {
+                    await service.clearCodebuddyStickySessions();
+                    await refreshRuntimeStatus();
+                    return await service.getCodebuddyLocalAccessState();
+                  });
+                }}
+              >
+                清除会话粘性
+              </button>
+              <span className="cblas-kpi-foot">
+                当前粘性 {runtimeStatus?.sessionAffinityCount ?? 0} 条 · 换号：冷却中自动解绑并选下一号
+              </span>
+            </div>
           </div>
         ) : runtimeView === "usage" ? (
           <div>
@@ -783,7 +1621,7 @@ export function CodebuddyApiServicePage() {
               }}
             >
               <span>
-                共 {requestTotal} 条 · 每页
+                共 {requestTotal} 条（SQLite 全量） · 每页
               </span>
               <select
                 className="cblas-select"
@@ -791,11 +1629,11 @@ export function CodebuddyApiServicePage() {
                 value={String(requestPageSize)}
                 disabled={requestsLoading}
                 onChange={(e) => {
-                  const size = Number(e.target.value) || 20;
+                  const size = Number(e.target.value) || 50;
                   void loadRequestPage(0, size);
                 }}
               >
-                {[10, 20, 50].map((n) => (
+                {[20, 50, 100, 200, 500].map((n) => (
                   <option key={n} value={String(n)}>
                     {n}
                   </option>
@@ -851,7 +1689,20 @@ export function CodebuddyApiServicePage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {requestRecords.map((rec: CodebuddyRequestRecord) => {
+                  {requestRecords
+                    .filter((rec: CodebuddyRequestRecord) => {
+                      if (logFilterAccount && !(rec.accountId || rec.accountLabel || "").toLowerCase().includes(logFilterAccount.toLowerCase())) {
+                        return false;
+                      }
+                      if (logFilterModel && !(rec.model || "").toLowerCase().includes(logFilterModel.toLowerCase())) {
+                        return false;
+                      }
+                      if (logFilterOutcome && rec.outcome !== logFilterOutcome) {
+                        return false;
+                      }
+                      return true;
+                    })
+                    .map((rec: CodebuddyRequestRecord) => {
                     const expanded = expandedRequestId === rec.id;
                     const prompt = rec.promptTokens ?? 0;
                     const cacheRead = rec.cachedTokens ?? 0;
@@ -1003,8 +1854,8 @@ export function CodebuddyApiServicePage() {
         )}
       </section>
 
-      <section className="cblas-card">
-        <h3>服务</h3>
+      <section className="cblas-card" hidden={pageTab !== "overview" && pageTab !== "keys"}>
+        <h3>{pageTab === "keys" ? "连接信息" : "服务控制"}</h3>
         <div className="cblas-row">
           <button
             type="button"
@@ -1081,6 +1932,150 @@ export function CodebuddyApiServicePage() {
           </div>
         ) : null}
 
+        <div className="cblas-row" style={{ alignItems: "flex-start" }}>
+          <span className="cblas-label">附加密钥</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+              可给不同客户端发独立密钥；某一 Key 频繁中断只会冷却该 Key，不会打死账号池。
+              下方可按 Key 查看调用量与流水。
+            </div>
+            <table className="cblas-table" style={{ marginBottom: 10 }}>
+              <thead>
+                <tr>
+                  <th>Key</th>
+                  <th>调用</th>
+                  <th>成功</th>
+                  <th>失败</th>
+                  <th>Tokens</th>
+                  <th>Credit</th>
+                  <th>流水</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Primary</td>
+                  <td>{apiKeyStats["(unknown)"]?.requests ?? apiKeyStats["Primary"]?.requests ?? "—"}</td>
+                  <td>{apiKeyStats["(unknown)"]?.ok ?? apiKeyStats["Primary"]?.ok ?? "—"}</td>
+                  <td>{apiKeyStats["(unknown)"]?.fail ?? apiKeyStats["Primary"]?.fail ?? "—"}</td>
+                  <td>{formatTokenCount(apiKeyStats["(unknown)"]?.tokens ?? apiKeyStats["Primary"]?.tokens)}</td>
+                  <td>{formatCredit(apiKeyStats["(unknown)"]?.credit ?? apiKeyStats["Primary"]?.credit)}</td>
+                  <td>
+                    <button
+                      type="button"
+                      className="cblas-button"
+                      onClick={() => {
+                        setApiKeyFilter("");
+                        setRuntimeView("requests");
+                        void loadRequestPage(0, requestPageSize, "");
+                      }}
+                    >
+                      查看
+                    </button>
+                  </td>
+                </tr>
+                {(collection?.clientKeys ?? []).map((item) => {
+                  const st =
+                    apiKeyStats[item.id] ||
+                    apiKeyStats[item.label] ||
+                    Object.entries(apiKeyStats).find(
+                      ([k]) => k.includes(item.id) || k.includes(item.label),
+                    )?.[1] ||
+                    {};
+                  return (
+                    <tr key={item.id}>
+                      <td>
+                        {item.label || item.id}
+                        {!item.enabled ? "（停用）" : ""}
+                      </td>
+                      <td>{st.requests ?? "—"}</td>
+                      <td>{st.ok ?? "—"}</td>
+                      <td>{st.fail ?? "—"}</td>
+                      <td>{formatTokenCount(st.tokens)}</td>
+                      <td>{formatCredit(st.credit)}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="cblas-button"
+                          onClick={() => {
+                            setApiKeyFilter(item.id || item.label);
+                            setRuntimeView("requests");
+                            void loadRequestPage(0, requestPageSize, item.id || item.label);
+                          }}
+                        >
+                          查看
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            {(collection?.clientKeys ?? []).map((item, index) => (
+              <div className="cblas-row" key={item.id || index} style={{ marginBottom: 6 }}>
+                <input
+                  className="cblas-input"
+                  style={{ width: 120 }}
+                  value={item.label}
+                  placeholder="命名"
+                  onChange={(e) => {
+                    const next = [...(collection?.clientKeys ?? [])];
+                    next[index] = { ...item, label: e.target.value };
+                    // 改名不重启服务，只热更新运行文件 + 本地配置
+                    void run(() => service.saveCodebuddyClientKeys(next));
+                  }}
+                  disabled={busy}
+                />
+                <span className="cblas-mono" style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {item.key}
+                </span>
+                <button
+                  type="button"
+                  className="cblas-button"
+                  onClick={() => void copy(`ck-${item.id}`, item.key)}
+                >
+                  {copied === `ck-${item.id}` ? "已复制" : "复制"}
+                </button>
+                <button
+                  type="button"
+                  className="cblas-button"
+                  onClick={() => {
+                    const next = (collection?.clientKeys ?? []).filter((_, i) => i !== index);
+                    void run(() => service.saveCodebuddyClientKeys(next));
+                  }}
+                  disabled={busy}
+                >
+                  删除
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className="cblas-button"
+              disabled={busy || !collection}
+              onClick={() => {
+                const key = `cbk-${Math.random().toString(36).slice(2, 10)}${Math.random()
+                  .toString(36)
+                  .slice(2, 10)}`;
+                const next = [
+                  ...(collection?.clientKeys ?? []),
+                  {
+                    id: `ck_${Date.now()}`,
+                    label: `Key ${(collection?.clientKeys?.length ?? 0) + 1}`,
+                    key,
+                    enabled: true,
+                  },
+                ];
+                void run(() => service.saveCodebuddyClientKeys(next));
+              }}
+            >
+              添加密钥
+            </button>
+            <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
+              改名 / 增删附加密钥不会重启服务；若网关层鉴权未立刻生效，可手动点一次「重启服务」。
+            </div>
+          </div>
+        </div>
+
         {state?.lanBaseUrl ? (
           <div className="cblas-row">
             <span className="cblas-label">局域网地址</span>
@@ -1096,7 +2091,7 @@ export function CodebuddyApiServicePage() {
         ) : null}
       </section>
 
-      <section className="cblas-card">
+      <section className="cblas-card" hidden={pageTab !== "accounts" && pageTab !== "overview"}>
         <h3>配置</h3>
         <div className="cblas-row">
           <span className="cblas-label">监听端口</span>
@@ -1156,7 +2151,7 @@ export function CodebuddyApiServicePage() {
         </div>
       </section>
 
-      <section className="cblas-card">
+      <section className="cblas-card" hidden={pageTab !== "accounts"}>
         <div className="cblas-card-head">
           <h3>
             账号池（{selectedRefs.length}/{flatAccounts.length} 已启用）
@@ -1317,8 +2312,13 @@ export function CodebuddyApiServicePage() {
         )}
       </section>
 
-      <section className="cblas-card">
-        <h3>模型（{(state?.modelIds ?? []).length} 个已启用）</h3>
+      <section className="cblas-card" hidden={pageTab !== "models"}>
+        <h3>
+          模型目录
+          <span style={{ fontWeight: 400, fontSize: 12, marginLeft: 8, opacity: 0.7 }}>
+            参数 · 积分倍率 · 实测是否免费 · 调用消耗 · 可禁用
+          </span>
+        </h3>
         <div className="cblas-row">
           <button
             type="button"
@@ -1327,7 +2327,7 @@ export function CodebuddyApiServicePage() {
             disabled={fetchingModels || !collection || selectedRefs.length === 0}
           >
             <Download size={14} />
-            <span style={{ marginLeft: 6 }}>{fetchingModels ? "拉取中…" : "拉取模型"}</span>
+            <span style={{ marginLeft: 6 }}>{fetchingModels ? "拉取中…" : "拉取企业模型"}</span>
           </button>
           {fetchedModels.length > 0 ? (
             <button
@@ -1340,46 +2340,348 @@ export function CodebuddyApiServicePage() {
             </button>
           ) : null}
           <span className="cblas-subtitle" style={{ margin: 0 }}>
-            模型列表从上游企业接口实时拉取，比内置预设更新
+            拉取后写入 catalog（上下文/efforts），sidecar 合并 models.dev 与实测 credit
           </span>
         </div>
-
+        {runtimeStatus?.costExplore ? (
+          <div style={{ fontSize: 12, opacity: 0.75, margin: "6px 0" }}>
+            cost explore：{runtimeStatus.costExplore.enabled ? "开" : "关"} · 窗口{" "}
+            {runtimeStatus.costExplore.interval || "30m"} ·{" "}
+            {runtimeStatus.costExplore.note || "免费优先探索未知号"}
+          </div>
+        ) : null}
+        <div className="cblas-row" style={{ margin: "8px 0" }}>
+          <span className="cblas-label">夜间免费</span>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+            <input
+              type="checkbox"
+              checked={!!collection?.nightFreeEnabled}
+              onChange={(e) => {
+                void run(async () => {
+                  await service.setCodebuddyNightFree(
+                    e.target.checked,
+                    collection?.nightFreeModels ?? ["hy3"],
+                  );
+                  return await service.restartCodebuddyLocalAccess();
+                });
+              }}
+              disabled={busy}
+            />
+            启用 23:00–08:00 CST 免费窗口（窗外拒绝，防计费）
+          </label>
+          <input
+            className="cblas-input"
+            style={{ flex: 1, minWidth: 180 }}
+            value={(collection?.nightFreeModels ?? []).join(",")}
+            placeholder="hy3,deepseek-v4.1-flash"
+            onChange={(e) => {
+              const list = e.target.value
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean);
+              void run(() =>
+                service.setCodebuddyNightFree(!!collection?.nightFreeEnabled, list).then(
+                  service.restartCodebuddyLocalAccess,
+                ),
+              );
+            }}
+            disabled={busy}
+          />
+          {runtimeStatus?.nightFree ? (
+            <span style={{ fontSize: 12, opacity: 0.8 }}>
+              {runtimeStatus.nightFree.window} ·{" "}
+              {runtimeStatus.nightFree.inWindow ? "窗口内" : "窗外（禁用列表模型）"}
+            </span>
+          ) : null}
+        </div>
         {modelsMessage ? <div className="cblas-note">{modelsMessage}</div> : null}
+        <div className="cblas-model-table">
+          {(() => {
+            const catalog = runtimeStatus?.catalog ?? [];
+            const disabledSet = new Set(
+              (collection?.disabledModels ?? []).map((x) => x.toLowerCase()),
+            );
+            const usageMap = new Map(
+              (modelUsage ?? []).map((row) => [row.model.toLowerCase(), row]),
+            );
+            const rows: CodebuddyModelCatalogRow[] =
+              catalog.length > 0
+                ? catalog
+                : (fetchedModels.length > 0
+                    ? fetchedModels
+                    : (state?.modelIds ?? []).map((id) => ({ id, name: id, cli: true }))
+                  ).map((m) => ({
+                    id: m.id,
+                    name: (m as { name?: string }).name,
+                    contextLength: (m as { contextLength?: number }).contextLength,
+                    maxOutputTokens: (m as { maxOutputTokens?: number }).maxOutputTokens,
+                    efforts: (m as { efforts?: string[] }).efforts ?? [],
+                    supportsImages: (m as { supportsImages?: boolean }).supportsImages,
+                    supportsReasoning: (m as { supportsReasoning?: boolean }).supportsReasoning,
+                    cli: (m as { cli?: boolean }).cli,
+                    description: (m as { description?: string }).description,
+                    credits: (m as { credits?: string }).credits,
+                    creditsRate: (m as { creditsRate?: number }).creditsRate,
+                    tags: (m as { tags?: string[] }).tags ?? [],
+                    vendor: (m as { vendor?: string }).vendor,
+                    isDefault: (m as { isDefault?: boolean }).isDefault,
+                    onlyReasoning: (m as { onlyReasoning?: boolean }).onlyReasoning,
+                    maxAllowedSize: (m as { maxAllowedSize?: number }).maxAllowedSize,
+                    disabled: disabledSet.has(m.id.toLowerCase()),
+                  }));
+            return rows.map((model) => {
+              const usage = usageMap.get(model.id.toLowerCase());
+              const free =
+                model.freeObserved === true ||
+                (model.freeObserved == null &&
+                  typeof model.creditsRate === "number" &&
+                  model.creditsRate === 0);
+              const isDisabled = disabledSet.has(model.id.toLowerCase()) || !!model.disabled;
+              return (
+                <div className={`cblas-model-row ${isDisabled ? "is-disabled" : ""}`} key={model.id}>
+                  <div className="cblas-model-main">
+                    <span className="cblas-model-id">{model.id}</span>
+                    {model.name && model.name !== model.id ? (
+                      <span className="cblas-model-name">{model.name}</span>
+                    ) : null}
+                    {model.cli !== false ? <span className="cblas-model-tag">CLI</span> : null}
+                    {model.isDefault ? <span className="cblas-model-tag">默认</span> : null}
+                    {model.supportsImages ? <span className="cblas-model-tag">多模态</span> : null}
+                    {model.supportsReasoning || model.onlyReasoning ? (
+                      <span className="cblas-model-tag">推理</span>
+                    ) : null}
+                    {(model.tags ?? []).map((tag) => (
+                      <span
+                        key={tag}
+                        className={`cblas-model-tag ${
+                          tag.includes("限时免费") || /free/i.test(tag) ? "is-free" : ""
+                        }`}
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                    <span className={`cblas-model-tag ${free ? "is-free" : "is-paid"}`}>
+                      {model.credits
+                        ? `credits ${model.credits}`
+                        : model.creditsRate != null
+                          ? `credits x${model.creditsRate}`
+                          : free
+                            ? "免费/限免"
+                            : "计费未知"}
+                    </span>
+                    {isDisabled ? <span className="cblas-model-tag is-off">已禁用</span> : null}
+                  </div>
+                  <div className="cblas-model-meta">
+                    上下文 {model.contextLength ? `${Math.round((model.contextLength || 0) / 1000)}K` : "—"}
+                    {" · "}输出 {model.maxOutputTokens ? `${Math.round((model.maxOutputTokens || 0) / 1000)}K` : "—"}
+                    {model.maxAllowedSize ? ` · 允许输入 ${Math.round(model.maxAllowedSize / 1000)}K` : ""}
+                    {model.efforts?.length ? ` · 档位 ${model.efforts.join("/")}` : ""}
+                    {model.vendor ? ` · vendor ${model.vendor}` : ""}
+                    {model.source ? ` · 来源 ${model.source}` : ""}
+                  </div>
+                  <div className="cblas-model-meta">
+                    原始字段：credits=
+                    <span className="cblas-mono">{model.credits || "—"}</span>
+                    {model.creditsRate != null ? (
+                      <>
+                        {" "}
+                        rate=
+                        <span className="cblas-mono">{model.creditsRate}</span>
+                      </>
+                    ) : null}
+                    {" · tags="}
 
-        {fetchedModels.length > 0 ? (
-          <div className="cblas-model-table">
-            {fetchedModels.map((model) => (
-              <div className="cblas-model-row" key={model.id}>
-                <div className="cblas-model-main">
-                  <span className="cblas-model-id">{model.id}</span>
-                  {model.name ? <span className="cblas-model-name">{model.name}</span> : null}
-                  {model.cli ? <span className="cblas-model-tag">CLI</span> : null}
-                  {model.supportsImages ? <span className="cblas-model-tag">多模态</span> : null}
-                  {model.supportsReasoning ? <span className="cblas-model-tag">推理</span> : null}
+                    <span className="cblas-mono">
+                      {(model.tags ?? []).length ? (model.tags ?? []).join(" | ") : "—"}
+                    </span>
+                    {model.vendor ? (
+                      <>
+                        {" · vendor="}
+
+                        <span className="cblas-mono">{model.vendor}</span>
+                      </>
+                    ) : null}
+                    {model.onlyReasoning ? " · onlyReasoning" : ""}
+                  </div>
+                  <div className="cblas-model-meta">
+                    消耗：请求 {usage?.requests ?? model.requests ?? 0} · tokens{" "}
+                    {formatTokenCount(usage?.totalTokens ?? model.totalTokens)} · credit{" "}
+                    {formatCredit(usage?.credit ?? model.totalCredit)}
+                    {model.costPer1k != null
+                      ? ` · 实测 ${model.costTier === 0 ? "免费" : `${formatCredit(model.costPer1k)}/1k`}`
+                      : " · 实测待学习"}
+                  </div>
+                  {model.accountsAlwaysFree?.length || model.accountsNightFree?.length ? (
+                    <div className="cblas-model-meta">
+                      {model.accountsAlwaysFree?.length ? (
+                        <span className="cblas-model-tag is-free" style={{ marginRight: 6 }}>
+                          全天免费号：{model.accountsAlwaysFree.join("、")}
+                        </span>
+                      ) : null}
+                      {model.accountsNightFree?.length ? (
+                        <span className="cblas-model-tag is-paid">
+                          仅夜间免费号：{model.accountsNightFree.join("、")}
+                        </span>
+                      ) : null}
+                      {model.freePolicySummary ? (
+                        <div style={{ opacity: 0.8 }}>{model.freePolicySummary}</div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {model.description ? <div className="cblas-model-desc">{model.description}</div> : null}
+                  <div style={{ marginTop: 4, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="cblas-button cblas-button--primary"
+                      disabled={busy || !collection?.accounts?.length}
+                      title="把该模型加入所有已选账号的「全天免费」分组"
+                      onClick={() => {
+                        void (async () => {
+                          setBusy(true);
+                          try {
+                            for (const acc of collection?.accounts ?? []) {
+                              const prev =
+                                collection?.accounts?.find(
+                                  (a) =>
+                                    a.accountId === acc.accountId &&
+                                    a.platform === acc.platform,
+                                ) ?? acc;
+                              const always = new Set(prev.alwaysFreeModels ?? []);
+                              always.add(model.id);
+                              const night = new Set(prev.nightOnlyFreeModels ?? []);
+                              night.delete(model.id);
+                              await service.setCodebuddyAccountFreeModels({
+                                accountId: acc.accountId,
+                                platform: acc.platform,
+                                alwaysFreeModels: Array.from(always),
+                                nightOnlyFreeModels: Array.from(night),
+                              });
+                            }
+                            const next = await service.restartCodebuddyLocalAccess();
+                            setState(next);
+                            setPortDraft(String(next.collection.port));
+                            setModelsMessage(`${model.id} 已加入全天免费分组（所有已选账号）`);
+                          } catch (err) {
+                            setError(err instanceof Error ? err.message : String(err));
+                          } finally {
+                            setBusy(false);
+                          }
+                        })();
+                      }}
+                    >
+                      加入全天免费
+                    </button>
+                    <button
+                      type="button"
+                      className="cblas-button"
+                      disabled={busy || !collection?.accounts?.length}
+                      title="把该模型加入所有已选账号的「仅夜间免费」分组"
+                      onClick={() => {
+                        void (async () => {
+                          setBusy(true);
+                          try {
+                            for (const acc of collection?.accounts ?? []) {
+                              const prev =
+                                collection?.accounts?.find(
+                                  (a) =>
+                                    a.accountId === acc.accountId &&
+                                    a.platform === acc.platform,
+                                ) ?? acc;
+                              const night = new Set(prev.nightOnlyFreeModels ?? []);
+                              night.add(model.id);
+                              const always = new Set(prev.alwaysFreeModels ?? []);
+                              always.delete(model.id);
+                              await service.setCodebuddyAccountFreeModels({
+                                accountId: acc.accountId,
+                                platform: acc.platform,
+                                alwaysFreeModels: Array.from(always),
+                                nightOnlyFreeModels: Array.from(night),
+                              });
+                            }
+                            const next = await service.restartCodebuddyLocalAccess();
+                            setState(next);
+                            setModelsMessage(`${model.id} 已加入仅夜间免费分组（所有已选账号）`);
+                          } catch (err) {
+                            setError(err instanceof Error ? err.message : String(err));
+                          } finally {
+                            setBusy(false);
+                          }
+                        })();
+                      }}
+                    >
+                      加入仅夜间免费
+                    </button>
+                    <button
+                      type="button"
+                      className="cblas-button"
+                      disabled={busy || !collection?.accounts?.length}
+                      title="从所有已选账号的免费分组移除"
+                      onClick={() => {
+                        void (async () => {
+                          setBusy(true);
+                          try {
+                            for (const acc of collection?.accounts ?? []) {
+                              const prev =
+                                collection?.accounts?.find(
+                                  (a) =>
+                                    a.accountId === acc.accountId &&
+                                    a.platform === acc.platform,
+                                ) ?? acc;
+                              const always = (prev.alwaysFreeModels ?? []).filter(
+                                (x) => x.toLowerCase() !== model.id.toLowerCase(),
+                              );
+                              const night = (prev.nightOnlyFreeModels ?? []).filter(
+                                (x) => x.toLowerCase() !== model.id.toLowerCase(),
+                              );
+                              await service.setCodebuddyAccountFreeModels({
+                                accountId: acc.accountId,
+                                platform: acc.platform,
+                                alwaysFreeModels: always,
+                                nightOnlyFreeModels: night,
+                              });
+                            }
+                            const next = await service.restartCodebuddyLocalAccess();
+                            setState(next);
+                            setModelsMessage(`${model.id} 已移出免费分组`);
+                          } catch (err) {
+                            setError(err instanceof Error ? err.message : String(err));
+                          } finally {
+                            setBusy(false);
+                          }
+                        })();
+                      }}
+                    >
+                      移出分组
+                    </button>
+                    <button
+                      type="button"
+                      className={`cblas-button ${isDisabled ? "" : "cblas-button"}`}
+                      onClick={() => {
+                        const next = new Set(disabledSet);
+                        if (isDisabled) {
+                          next.delete(model.id.toLowerCase());
+                        } else {
+                          next.add(model.id.toLowerCase());
+                        }
+                        const list = Array.from(next);
+                        void run(async () => {
+                          await service.setCodebuddyDisabledModels(list);
+                          return await service.restartCodebuddyLocalAccess();
+                        });
+                      }}
+                      disabled={busy}
+                    >
+                      {isDisabled ? "启用模型" : "禁用模型"}
+                    </button>
+                  </div>
                 </div>
-                <div className="cblas-model-meta">
-                  {model.contextLength > 0 ? `上下文 ${Math.round(model.contextLength / 1000)}K` : ""}
-                  {model.maxOutputTokens > 0 ? ` · 输出 ${Math.round(model.maxOutputTokens / 1000)}K` : ""}
-                  {model.efforts.length > 0 ? ` · 档位 ${model.efforts.join("/")}` : ""}
-                </div>
-                {model.description ? (
-                  <div className="cblas-model-desc">{model.description}</div>
-                ) : null}
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="cblas-models">
-            {(state?.modelIds ?? []).map((model) => (
-              <span className="cblas-model-chip" key={model}>
-                {model}
-              </span>
-            ))}
-          </div>
-        )}
+              );
+            });
+          })()}
+        </div>
       </section>
 
-      <section className="cblas-card">
+      <section className="cblas-card" hidden={pageTab !== "help"}>
         <h3>接入说明</h3>
         <div className="cblas-usage">
           1. 点击「启动服务」，确认状态为「运行中」。<br />
@@ -1390,6 +2692,8 @@ export function CodebuddyApiServicePage() {
           5. 令牌失效时 sidecar 会自动续期并回写到账号库，无需重新登录。
         </div>
       </section>
+
+      </div>
 
       {probeOpen ? (
         <div className="cblas-modal-backdrop" role="dialog" aria-modal="true">

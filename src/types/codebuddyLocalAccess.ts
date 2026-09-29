@@ -8,17 +8,83 @@ export interface CodebuddyLocalAccessAccountRef {
   platform: CodebuddyLocalAccessPlatform;
   accountId: string;
   label?: string | null;
+  alwaysFreeModels?: string[];
+  nightOnlyFreeModels?: string[];
+}
+
+export interface CodebuddyClientKey {
+  id: string;
+  label: string;
+  key: string;
+  enabled: boolean;
+  /** Bind this key to a model group (accounts + optional model allow-list). */
+  modelGroupId?: string | null;
+}
+
+export interface CodebuddyModelGroup {
+  id: string;
+  name: string;
+  accountIds?: string[];
+  accountKeys?: string[];
+  modelIds?: string[];
+  kind?: string | null;
+}
+
+export interface CodebuddyAccountModelCatalog {
+  accountId: string;
+  platform?: string;
+  label?: string;
+  models?: Array<Record<string, unknown>>;
+}
+
+export interface CodebuddyModelCatalogRow {
+  id: string;
+  name?: string;
+  contextLength?: number;
+  maxOutputTokens?: number;
+  credits?: string;
+  creditsRate?: number;
+  tags?: string[];
+  vendor?: string | null;
+  isDefault?: boolean;
+  onlyReasoning?: boolean;
+  maxAllowedSize?: number;
+  efforts?: string[];
+  supportsImages?: boolean;
+  supportsReasoning?: boolean;
+  supportsToolCall?: boolean;
+  cli?: boolean;
+  disabled?: boolean;
+  freeObserved?: boolean | null;
+  costPer1k?: number | null;
+  costTier?: number | null;
+  costSamples?: number;
+  accountsAlwaysFree?: string[];
+  accountsNightFree?: string[];
+  freePolicySummary?: string;
+  requests?: number;
+  totalTokens?: number;
+  totalCredit?: number;
+  source?: string;
+  description?: string;
 }
 
 export interface CodebuddyLocalAccessCollection {
   enabled: boolean;
   port: number;
   apiKey: string;
+  clientKeys?: CodebuddyClientKey[];
   accessScope: CodebuddyLocalAccessScope;
   includeReasoning: boolean;
   routingStrategy: CodebuddyLocalAccessRoutingStrategy;
   accounts: CodebuddyLocalAccessAccountRef[];
   modelIds: string[];
+  disabledModels?: string[];
+  modelCatalog?: Array<Record<string, unknown>>;
+  nightFreeEnabled?: boolean;
+  nightFreeModels?: string[];
+  modelGroups?: CodebuddyModelGroup[];
+  accountModelCatalogs?: CodebuddyAccountModelCatalog[];
 }
 
 export interface CodebuddyLocalAccessAccountOption {
@@ -59,6 +125,7 @@ export interface CodebuddyLocalAccessSavePayload {
   routingStrategy?: CodebuddyLocalAccessRoutingStrategy;
   accounts?: CodebuddyLocalAccessAccountRef[];
   modelIds?: string[];
+  clientKeys?: CodebuddyClientKey[];
 }
 
 export interface CodebuddyModelInfo {
@@ -73,6 +140,13 @@ export interface CodebuddyModelInfo {
   description?: string | null;
   /** 上游 `cli` agent 暴露（即网关真正可用）。 */
   cli: boolean;
+  credits?: string | null;
+  creditsRate?: number | null;
+  tags?: string[];
+  vendor?: string | null;
+  isDefault?: boolean;
+  onlyReasoning?: boolean;
+  maxAllowedSize?: number;
 }
 
 export interface CodebuddyFetchModelsAccountResult {
@@ -166,6 +240,30 @@ export interface CodebuddyModelUsageRow {
   lastAt?: string | null;
 }
 
+export interface CodebuddyPoolAccount {
+  id: string;
+  uid?: string;
+  label?: string;
+  realm?: string;
+  credits?: number;
+  creditsExpiring?: number;
+  creditsKnown?: boolean;
+  inFlight?: number;
+  maxInFlight?: number;
+  weight?: number;
+  disabled?: boolean;
+  disableReason?: string;
+  wafUntil?: string | null;
+  degradeUntil?: string | null;
+  alwaysFreeModels?: string[];
+  nightOnlyFreeModels?: string[];
+  modelCosts?: Record<
+    string,
+    { costPer1k?: number; tier?: number; samples?: number; lastSeen?: string }
+  >;
+  modelCooldowns?: Array<{ model: string; until?: string }>;
+}
+
 export interface CodebuddyRuntimeStatus {
   promptMode?: string;
   rateLimitedModels?: CodebuddyRateLimitedModel[];
@@ -177,4 +275,35 @@ export interface CodebuddyRuntimeStatus {
   modelUsage?: CodebuddyModelUsageRow[];
   sessionAffinityCount?: number;
   accounts?: Array<Record<string, unknown>>;
+  pool?: {
+    accounts?: CodebuddyPoolAccount[];
+    costExploreEvents?: number;
+    wafIpActive?: boolean;
+    wafIpUntil?: string | null;
+  };
+  modelCredits?: Record<string, string>;
+  modelEfforts?: Record<string, string[]>;
+  catalog?: CodebuddyModelCatalogRow[];
+  costExplore?: {
+    enabled?: boolean;
+    interval?: string;
+    defaultInterval?: string;
+    env?: string;
+    note?: string;
+  };
+  apiKeyStats?: Record<
+    string,
+    { ok?: number; fail?: number; credit?: number; tokens?: number; requests?: number; apiKeyLabel?: string }
+  >;
+  disabledModels?: string[];
+  nightFree?: {
+    enabled?: boolean;
+    models?: string[];
+    startHour?: number;
+    endHour?: number;
+    window?: string;
+    inWindow?: boolean;
+    nowCST?: string;
+    behavior?: string;
+  };
 }
