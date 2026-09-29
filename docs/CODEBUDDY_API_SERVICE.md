@@ -77,9 +77,18 @@ Response rewrite (`sanitizeCodebuddyChunk`):
 Non-streaming clients get a synthesized `chat.completion` object aggregated from
 the upstream stream, including merged `tool_calls` by index.
 
-Account selection is round-robin (or random) across the scoped upstreams, with
-fall-through to the next account when the upstream rejects the request before any
-byte was written to the client.
+Account selection is **pool-aware** (ported from workbuddy2api semantics):
+
+- three-factor weight: `credits×10 + expiring×8 + idle` (credits from Rust quota when known);
+- costTier free-first using live `usage.credit` observations (TTL 6h, `free tier ended` log);
+- top-5 shortlist lottery + anti-herd 100ms pick gap + in-flight lease (`maxInFlight=2`);
+- realm prefix `cn:` / `global:` filters upstreams; sticky conversation still wins when healthy;
+- WAF 403 → account soft-cooldown + IP fail-fast when ≥2 accounts hit in 60s;
+- rotate backoff between accounts; 12153 session-dead disables after 3 strikes;
+- `/v1/codebuddy/status.pool` exposes weights, modelCosts, cooldowns, cost-explore events.
+
+Manifest fields: `codebuddyUpstreams[].realm|credits|creditsExpiring`, `modelCredits`, `modelEfforts`.
+State files live under `COCKPIT_CODEBUDDY_STATE_DIR` (`codebuddy_pool_state.json` + request ledger).
 
 ## HTTP surface
 
@@ -95,15 +104,25 @@ byte was written to the client.
   routing strategy, selected accounts, model filter).
 - `codebuddy_local_access_sidecar/config.json` + `manifest.json`: generated
   runtime files; the manifest contains live JWTs and must stay local.
+- `codebuddy_local_access_logs.sqlite`: durable request history + usage stats.
+  The sidecar emits a `codebuddy_usage` stdout event after each ledger append;
+  Cockpit writes it to SQLite (WAL). UI query commands read this store so
+  history survives service restarts and the 500-entry ring buffer eviction.
+  When the durable DB is empty and the sidecar is live, Cockpit backfills once
+  from `/v1/codebuddy/requests`.
 
 ## Tests
 
 - `sidecars/cockpit-cliproxy/codebuddy_gateway_test.go`: header/body rewrite,
   stream sanitization, non-stream aggregation, tool-call merging, error mapping,
   account fall-through, model endpoint.
+- `sidecars/cockpit-cliproxy/codebuddy_request_log_test.go`: ring buffer and
+  `codebuddy_usage` emit.
 - `src-tauri/src/modules/codebuddy_local_access.rs` `#[cfg(test)]`: collection
   normalization, JWT expiry decoding, manifest requirements, bind host, catalog
   fallback.
+- `src-tauri/src/modules/codebuddy_local_access_request_logs.rs` `#[cfg(test)]`:
+  SQLite insert/dedupe, model usage aggregation, account stats.
 
 ## Known limitations
 
