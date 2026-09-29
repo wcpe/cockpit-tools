@@ -53,6 +53,11 @@ import { WorkbuddyActivityLogsPanel } from './WorkbuddyActivityLogsPanel';
 
 export const WORKBUDDY_ACTIVITY_SCHEDULE_CHANGED_EVENT = 'workbuddy-activity-schedule-changed';
 
+/** 账号列表分页：避免上百个账号卡片同时挂载卡死 UI。 */
+const ACCOUNT_PAGE_SIZE = 30;
+/** 卡片内执行日志预览最多行数。 */
+const ACCOUNT_LOG_PREVIEW_LINES = 8;
+
 const TAB_ICONS: Record<WorkbuddyActivityCenterTab, typeof Sparkles> = {
   growth: Sparkles,
   cat: Cat,
@@ -137,6 +142,12 @@ export function WorkbuddyActivityCenterModal({
   const [cacheInfo, setCacheInfo] = useState<{ count: number; newestAt?: string | null } | null>(
     null,
   );
+  const [visibleAccountCount, setVisibleAccountCount] = useState(ACCOUNT_PAGE_SIZE);
+
+  // 账号列表变化时重置分页
+  useEffect(() => {
+    setVisibleAccountCount(ACCOUNT_PAGE_SIZE);
+  }, [accounts.length]);
 
   const loadSchedule = useCallback(async () => {
     try {
@@ -577,141 +588,168 @@ export function WorkbuddyActivityCenterModal({
               {accounts.length === 0 ? (
                 <div style={{ opacity: 0.7 }}>{t('workbuddy.noAccounts', '暂无 WorkBuddy 账号')}</div>
               ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                  {accounts.map((account) => {
-                    const cn = isCnAccount(account);
-                    const info = overview[account.id];
-                    const log = runLogs[account.id];
-                    return (
-                      <div
-                        key={account.id}
-                        style={{
-                          border: '1px solid rgba(128,128,128,0.25)',
-                          borderRadius: 8,
-                          padding: 12,
-                        }}
-                      >
+                <>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {accounts.slice(0, visibleAccountCount).map((account) => {
+                      const cn = isCnAccount(account);
+                      const info = overview[account.id];
+                      const log = runLogs[account.id];
+                      const logPreview = log?.logs?.length
+                        ? log.logs.slice(0, ACCOUNT_LOG_PREVIEW_LINES).join('\n')
+                        : '';
+                      const logHidden =
+                        (log?.logs?.length ?? 0) > ACCOUNT_LOG_PREVIEW_LINES
+                          ? (log?.logs?.length ?? 0) - ACCOUNT_LOG_PREVIEW_LINES
+                          : 0;
+                      return (
                         <div
+                          key={account.id}
                           style={{
-                            display: 'flex',
-                            justifyContent: 'space-between',
-                            gap: 12,
-                            alignItems: 'center',
-                            flexWrap: 'wrap',
+                            border: '1px solid rgba(128,128,128,0.25)',
+                            borderRadius: 8,
+                            padding: 12,
                           }}
                         >
-                          <div style={{ minWidth: 0 }}>
-                            <div style={{ fontWeight: 600 }}>{resolveLabel(account)}</div>
-                            <div style={{ fontSize: 12, opacity: 0.75 }}>
-                              {cn
-                                ? info
-                                  ? t('workbuddy.activity.overviewLine', '能量 {{energy}} · 连登 {{streak}} · 猫猫 {{travel}}', {
-                                      energy: info.energy,
-                                      streak: info.streakDays,
-                                      travel: info.travel?.state ?? '-',
-                                    })
-                                  : t('workbuddy.activity.overviewPending', '总览加载中…')
-                                : t('workbuddy.activity.globalOnlyKeepalive', '国际版：仅 Token 保活适用')}
-                            </div>
-                          </div>
-                          {cn && (
-                            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                              <button
-                                className="btn btn-secondary icon-only"
-                                disabled={refreshingId === account.id || runningId === account.id}
-                                onClick={() => void refreshOneAccount(account.id)}
-                                title={t('workbuddy.activity.refreshOne', '刷新该账号状态')}
-                              >
-                                <RefreshCw
-                                  size={14}
-                                  className={refreshingId === account.id ? 'loading-spinner' : ''}
-                                />
-                              </button>
-                              <button
-                                className="btn btn-primary"
-                                disabled={runningId === account.id}
-                                onClick={() => void runAccount(account.id)}
-                              >
-                                {runningId === account.id ? (
-                                  <Loader2 size={14} className="loading-spinner" />
-                                ) : (
-                                  <Play size={14} />
-                                )}
-                                {t('workbuddy.activity.runNow', '立即执行')}
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                        {cn && activeTab === 'growth' && info?.tasks?.length ? (
                           <div
                             style={{
-                              marginTop: 8,
                               display: 'flex',
+                              justifyContent: 'space-between',
+                              gap: 12,
+                              alignItems: 'center',
                               flexWrap: 'wrap',
-                              gap: 6,
                             }}
                           >
-                            {info.tasks.slice(0, 8).map((task) => (
-                              <span
-                                key={task.taskCode}
-                                style={{
-                                  fontSize: 12,
-                                  padding: '2px 8px',
-                                  borderRadius: 999,
-                                  background:
-                                    task.status === 'claimed'
-                                      ? 'rgba(34,197,94,0.15)'
-                                      : 'rgba(148,163,184,0.15)',
-                                }}
-                              >
-                                {task.name} · {task.status}
-                              </span>
-                            ))}
-                          </div>
-                        ) : null}
-                        {cn && (activeTab === 'streakRewards' || activeTab === 'schoolSeason' || activeTab === 'miniprogram') ? (
-                          <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>
-                            {activeTab === 'streakRewards'
-                              ? t(
-                                  'workbuddy.activity.streakRewardsHint',
-                                  '今日已处理过则自动跳过（按天幂等）；礼包/补偿/补签/兑换/抽奖一次跑完',
-                                )
-                              : activeTab === 'schoolSeason'
-                                ? t(
-                                    'workbuddy.activity.schoolSeasonHint',
-                                    '需账号可访问开学季活动；未开放或已完成会静默跳过',
-                                  )
-                                : t(
-                                    'workbuddy.activity.miniprogramHint',
-                                    '小程序限定成长任务，缺任务清单时提示未开放',
+                            <div style={{ minWidth: 0 }}>
+                              <div style={{ fontWeight: 600 }}>{resolveLabel(account)}</div>
+                              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                                {cn
+                                  ? info
+                                    ? t('workbuddy.activity.overviewLine', '能量 {{energy}} · 连登 {{streak}} · 猫猫 {{travel}}', {
+                                        energy: info.energy,
+                                        streak: info.streakDays,
+                                        travel: info.travel?.state ?? '-',
+                                      })
+                                    : t('workbuddy.activity.overviewPending', '总览加载中…')
+                                  : t('workbuddy.activity.globalOnlyKeepalive', '国际版：仅 Token 保活适用')}
+                              </div>
+                            </div>
+                            {cn && (
+                              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                                <button
+                                  className="btn btn-secondary icon-only"
+                                  disabled={refreshingId === account.id || runningId === account.id}
+                                  onClick={() => void refreshOneAccount(account.id)}
+                                  title={t('workbuddy.activity.refreshOne', '刷新该账号状态')}
+                                >
+                                  <RefreshCw
+                                    size={14}
+                                    className={refreshingId === account.id ? 'loading-spinner' : ''}
+                                  />
+                                </button>
+                                <button
+                                  className="btn btn-primary"
+                                  disabled={runningId === account.id}
+                                  onClick={() => void runAccount(account.id)}
+                                >
+                                  {runningId === account.id ? (
+                                    <Loader2 size={14} className="loading-spinner" />
+                                  ) : (
+                                    <Play size={14} />
                                   )}
-                          </div>
-                        ) : null}
-                        {log?.logs?.length ? (
-                          <div
-                            style={{
-                              marginTop: 8,
-                              fontSize: 12,
-                              opacity: 0.85,
-                              whiteSpace: 'pre-wrap',
-                              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                            }}
-                          >
-                            {log.ok ? (
-                              <CheckCircle size={12} style={{ marginRight: 4 }} />
-                            ) : (
-                              <XCircle size={12} style={{ marginRight: 4 }} />
+                                  {t('workbuddy.activity.runNow', '立即执行')}
+                                </button>
+                              </div>
                             )}
-                            {log.logs.join('\n')}
-                            {log.earnedCredit > 0
-                              ? `\n${t('workbuddy.activity.earned', '到账积分')}: +${log.earnedCredit}`
-                              : ''}
                           </div>
-                        ) : null}
-                      </div>
-                    );
-                  })}
-                </div>
+                          {cn && activeTab === 'growth' && info?.tasks?.length ? (
+                            <div
+                              style={{
+                                marginTop: 8,
+                                display: 'flex',
+                                flexWrap: 'wrap',
+                                gap: 6,
+                              }}
+                            >
+                              {info.tasks.slice(0, 8).map((task) => (
+                                <span
+                                  key={task.taskCode}
+                                  style={{
+                                    fontSize: 12,
+                                    padding: '2px 8px',
+                                    borderRadius: 999,
+                                    background:
+                                      task.status === 'claimed'
+                                        ? 'rgba(34,197,94,0.15)'
+                                        : 'rgba(148,163,184,0.15)',
+                                  }}
+                                >
+                                  {task.name} · {task.status}
+                                </span>
+                              ))}
+                            </div>
+                          ) : null}
+                          {cn && (activeTab === 'streakRewards' || activeTab === 'schoolSeason' || activeTab === 'miniprogram') ? (
+                            <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>
+                              {activeTab === 'streakRewards'
+                                ? t(
+                                    'workbuddy.activity.streakRewardsHint',
+                                    '今日已处理过则自动跳过（按天幂等）；礼包/补偿/补签/兑换/抽奖一次跑完',
+                                  )
+                                : activeTab === 'schoolSeason'
+                                  ? t(
+                                      'workbuddy.activity.schoolSeasonHint',
+                                      '需账号可访问开学季活动；未开放或已完成会静默跳过',
+                                    )
+                                  : t(
+                                      'workbuddy.activity.miniprogramHint',
+                                      '小程序限定成长任务，缺任务清单时提示未开放',
+                                    )}
+                            </div>
+                          ) : null}
+                          {logPreview ? (
+                            <div
+                              style={{
+                                marginTop: 8,
+                                fontSize: 12,
+                                opacity: 0.85,
+                                whiteSpace: 'pre-wrap',
+                                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                                maxHeight: 96,
+                                overflow: 'auto',
+                              }}
+                            >
+                              {log?.ok ? (
+                                <CheckCircle size={12} style={{ marginRight: 4 }} />
+                              ) : (
+                                <XCircle size={12} style={{ marginRight: 4 }} />
+                              )}
+                              {logPreview}
+                              {logHidden > 0
+                                ? `\n… ${t('workbuddy.activity.moreLines', '另有 {{count}} 行（完整内容见活动日志）', { count: logHidden })}`
+                                : ''}
+                              {log && log.earnedCredit > 0
+                                ? `\n${t('workbuddy.activity.earned', '到账积分')}: +${log.earnedCredit}`
+                                : ''}
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {accounts.length > visibleAccountCount ? (
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ marginTop: 10 }}
+                      onClick={() => setVisibleAccountCount((n) => n + ACCOUNT_PAGE_SIZE)}
+                    >
+                      {t('workbuddy.activity.loadMoreAccounts', '加载更多账号（{{shown}} / {{total}}）', {
+                        shown: Math.min(visibleAccountCount, accounts.length),
+                        total: accounts.length,
+                      })}
+                    </button>
+                  ) : null}
+                </>
               )}
             </>
           ) : (
