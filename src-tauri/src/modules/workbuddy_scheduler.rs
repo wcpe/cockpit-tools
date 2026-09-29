@@ -30,12 +30,48 @@ use crate::modules::{
 const POLL_DELAY: Duration = Duration::from_secs(30);
 const INITIAL_SWEEP_DELAY: Duration = Duration::from_secs(10);
 const FIRE_COOLDOWN: Duration = Duration::from_secs(65);
+/// 迟到唤醒补跑派发前的网络宽限（对齐 workbuddy2api #152）。
+/// Windows Modern Standby exit 后 DNS/网络栈需 1–2s 恢复，零宽限派发会把
+/// 唯一一次补跑机会打在注定失败的窗口。准点轮询不受影响。
+const WAKEUP_GRACE_DELAY: Duration = Duration::from_secs(5);
+/// 轮询间隔超过该阈值视为睡眠唤醒/迟到补跑（POLL_DELAY 的 3 倍）。
+const WAKEUP_LATE_THRESHOLD: Duration = Duration::from_secs(90);
 const TOKEN_KEEPALIVE_THRESHOLD_SECS: i64 = 2 * 60 * 60;
 const NIGHT_WINDOW_HOURS: [u32; 9] = [23, 0, 1, 2, 3, 4, 5, 6, 7];
 
 static STORAGE_LOCK: Mutex<()> = Mutex::new(());
 static SCHEDULER_WAKE: OnceLock<Notify> = OnceLock::new();
 static IS_RUNNING: Mutex<bool> = Mutex::new(false);
+static LAST_POLL_AT: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+
+fn last_poll_at() -> &'static Mutex<Option<std::time::Instant>> {
+    LAST_POLL_AT.get_or_init(|| Mutex::new(None))
+}
+
+/// 轮询间隔超阈值时视为迟到唤醒，先等网络/DNS 就绪再派发。
+/// 返回是否继续执行（当前实现总是 true；预留取消语义）。
+async fn await_wakeup_grace_if_late(reason: &str) {
+    if reason == "手动立即触发" {
+        return;
+    }
+    let late = match last_poll_at().lock() {
+        Ok(guard) => match *guard {
+            None => false,
+            Some(prev) => prev.elapsed() > WAKEUP_LATE_THRESHOLD,
+        },
+        Err(_) => false,
+    };
+    if let Ok(mut guard) = last_poll_at().lock() {
+        *guard = Some(std::time::Instant::now());
+    }
+    if late {
+        logger::log_info(&format!(
+            "[WorkbuddyScheduler] wakeup grace {:?}: late catch-up ({})",
+            WAKEUP_GRACE_DELAY, reason
+        ));
+        tokio::time::sleep(WAKEUP_GRACE_DELAY).await;
+    }
+}
 
 fn scheduler_wake() -> &'static Notify {
     SCHEDULER_WAKE.get_or_init(Notify::new)
@@ -614,6 +650,10 @@ async fn run_schedule_cycle_inner(
     reason: &str,
     force_kinds: Option<Vec<ScheduleKind>>,
 ) -> Result<(), String> {
+    // 迟到唤醒（睡眠跨过槽位）派发前网络宽限；手动触发跳过。
+    if force_kinds.is_none() {
+        await_wakeup_grace_if_late(reason).await;
+    }
     let now = Local::now();
     let config = {
         let _guard = lock_storage()?;
