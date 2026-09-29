@@ -55,6 +55,8 @@ func (s *relayServer) router() *gin.Engine {
 	router.GET("/v1/models", s.handleModels)
 	router.GET("/v1/codebuddy/status", s.handleCodebuddyStatus)
 	router.GET("/v1/codebuddy/requests", s.handleCodebuddyRequests)
+	router.GET("/v1/codebuddy/models/catalog", s.handleCodebuddyCatalog)
+	router.POST("/v1/codebuddy/sessions/clear", s.handleCodebuddySessionsClear)
 	router.GET(cockpitQuotaPath, s.handleCockpitQuota)
 	router.POST("/v1/cockpit/auth/reset", s.handleResetAuthState)
 	router.POST("/v1/cockpit/accounts/reset-scheduler", s.handleResetSchedulerState)

@@ -133,6 +133,26 @@ type manifest struct {
 	AccountConcurrencyWaitMs int                     `json:"accountConcurrencyWaitMs"`
 	DebugLogs                *bool                   `json:"debugLogs,omitempty"`
 	CodebuddyUpstreams       []codebuddyUpstreamSpec `json:"codebuddyUpstreams,omitempty"`
+	// ModelEfforts: model id → supported reasoning efforts (from enterprise catalog).
+	ModelEfforts map[string][]string `json:"modelEfforts,omitempty"`
+	// ModelCredits: model id → catalog credit multiplier string (e.g. "x0.05").
+	ModelCredits map[string]string `json:"modelCredits,omitempty"`
+	// ModelCatalog: full enterprise rows (context/efforts/credits/tags/...).
+	ModelCatalog []map[string]any `json:"modelCatalog,omitempty"`
+	// DisabledModels: model ids rejected by the gateway (UI toggle).
+	DisabledModels []string `json:"disabledModels,omitempty"`
+	// CostExploreInterval: "30m" / "0" — mirrors workbuddy2api pool.cost_explore_interval.
+	CostExploreInterval string `json:"costExploreInterval,omitempty"`
+	// Night free-window models (WorkBuddy 夜猫子 23:00–08:00 CST).
+	// When enabled, these models are only callable inside the window.
+	NightFreeEnabled   bool     `json:"nightFreeEnabled,omitempty"`
+	NightFreeModels    []string `json:"nightFreeModels,omitempty"`
+	NightFreeStartHour *int     `json:"nightFreeStartHour,omitempty"`
+	NightFreeEndHour   *int     `json:"nightFreeEndHour,omitempty"`
+	// Model groups: named account sets (+ optional model allow-list) for key binding.
+	ModelGroups []map[string]any `json:"modelGroups,omitempty"`
+	// Per-account catalogs for UI diff / free binding.
+	AccountModelCatalogs []map[string]any `json:"accountModelCatalogs,omitempty"`
 
 	codebuddyByID     map[string]*codebuddyUpstreamSpec
 	apiKeyByValue     map[string]*apiKeySpec
@@ -159,6 +179,7 @@ type apiKeySpec struct {
 	ImageGenerationAccountIDs []string `json:"imageGenerationAccountIds,omitempty"`
 	AccountIDs                []string `json:"accountIds"`
 	ModelPrefix               string   `json:"modelPrefix,omitempty"`
+	ModelGroupID              string   `json:"modelGroupId,omitempty"`
 	ResponsesWebsockets       bool     `json:"responsesWebsockets,omitempty"`
 	AllowedModels             []string `json:"allowedModels"`
 	ExcludedModels            []string `json:"excludedModels"`
@@ -405,6 +426,17 @@ type codebuddyUpstreamSpec struct {
 	IncludeReasoning bool     `json:"includeReasoning,omitempty"`
 	Disabled         bool     `json:"disabled,omitempty"`
 	ExpiresAtMS      *int64   `json:"expiresAtMs,omitempty"`
+	// Pool intelligence (Rust materializes from account quota when known).
+	Realm           string `json:"realm,omitempty"`           // cn | global
+	Credits         *int64 `json:"credits,omitempty"`         // remaining credits
+	CreditsExpiring *int64 `json:"creditsExpiring,omitempty"` // expiring bucket
+	// Per-account model free policy (entitlements differ by account).
+	// AlwaysFreeModels: e.g. hy4-preview 全天免费 on this account.
+	AlwaysFreeModels []string `json:"alwaysFreeModels,omitempty"`
+	// NightOnlyFreeModels: e.g. hy4-preview 仅夜间 23:00–08:00 CST 免费。
+	NightOnlyFreeModels []string `json:"nightOnlyFreeModels,omitempty"`
+	// Per-account enterprise model catalog (credits/tags/...).
+	ModelCatalog []map[string]any `json:"modelCatalog,omitempty"`
 }
 
 type accountSpec struct {
@@ -1432,7 +1464,8 @@ func (p *requestPolicy) middleware() gin.HandlerFunc {
 
 		if spec != nil && isModelsRequest(c.Request) {
 			if isCodebuddyAPIKey(spec) {
-				c.JSON(http.StatusOK, codebuddyModelsResponse(codebuddyCatalogForAPIKey(p.manifest, spec)))
+				ids := codebuddyCatalogForAPIKey(p.manifest, spec)
+				c.JSON(http.StatusOK, codebuddyModelsResponse(ids))
 				c.Abort()
 				return
 			}
@@ -2511,6 +2544,13 @@ func rewriteBodyModel(m *manifest, spec *apiKeySpec, requestKind string, body []
 	if isCodebuddyAPIKey(spec) {
 		// CodeBuddy clients send the upstream model id verbatim; there is no
 		// catalog canonicalization step and no Codex-specific visibility list.
+		if codebuddyModelDisabled(m, model) {
+			return nil, model, fmt.Errorf("模型 %s 已被运营禁用", model)
+		}
+		night := codebuddyNightFreeFromManifest(m)
+		if ok, reason := night.AllowModel(model, time.Now()); !ok {
+			return nil, model, fmt.Errorf("模型 %s 不在夜间免费窗口: %s", model, reason)
+		}
 		if catalog := codebuddyCatalogForAPIKey(m, spec); len(catalog) > 0 && !stringSliceContainsFold(catalog, model) {
 			return nil, model, fmt.Errorf("模型 %s 不在当前 API Key 的可用模型范围内", model)
 		}

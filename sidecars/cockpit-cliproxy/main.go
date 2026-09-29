@@ -142,6 +142,11 @@ func main() {
 		emitter.emit(map[string]any{"type": "error", "message": err.Error()})
 		os.Exit(2)
 	}
+	// CodeBuddy pool + effort catalog from manifest (selection intelligence).
+	if len(m.CodebuddyUpstreams) > 0 {
+		codebuddyPoolInit().SyncFromManifest(m.CodebuddyUpstreams)
+		setCodebuddyModelEfforts(m.ModelEfforts)
+	}
 	emitter.emitStartupStage("init_runtime")
 	helps.SetRequestProxyRouteObserver(newRequestProxyRouteObserver(m.ProxyRouteObservers))
 	m.quotaCooldowns = newQuotaCooldownStateStore(*quotaPoolStatePath, m)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -9,9 +10,18 @@ func TestRequestLogAppendAndRing(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("COCKPIT_CODEBUDDY_STATE_DIR", dir)
 	codebuddyReqLog = nil
+	emitted := &capturingEmitter{}
+	globalCodebuddyEmitter = emitted
+	defer func() { globalCodebuddyEmitter = nil }()
 	store := codebuddyRequestLogInit()
 	for i := 0; i < codebuddyRequestLogMax+5; i++ {
 		store.Append(codebuddyRequestRecord{
+			AccountID: "a1",
+			Model:     "glm-5.2",
+			Outcome:   "ok",
+		})
+		emitCodebuddyUsageEvent(codebuddyRequestRecord{
+			ID:        "evt-" + itoa(uint64(i)),
 			AccountID: "a1",
 			Model:     "glm-5.2",
 			Outcome:   "ok",
@@ -24,6 +34,33 @@ func TestRequestLogAppendAndRing(t *testing.T) {
 	if records[0].ID == "" || records[0].ID == records[1].ID {
 		t.Fatalf("records not uniquely ordered: %q %q", records[0].ID, records[1].ID)
 	}
+	if len(emitted.events) != codebuddyRequestLogMax+5 {
+		t.Fatalf("emitted=%d want %d", len(emitted.events), codebuddyRequestLogMax+5)
+	}
+	last := emitted.events[len(emitted.events)-1]
+	if last["type"] != "codebuddy_usage" {
+		t.Fatalf("event type = %v", last["type"])
+	}
+	if last["model"] != "glm-5.2" || last["outcome"] != "ok" {
+		t.Fatalf("event payload = %#v", last)
+	}
+}
+
+type capturingEmitter struct {
+	mu     sync.Mutex
+	events []map[string]any
+}
+
+func (c *capturingEmitter) emit(v any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if m, ok := v.(map[string]any); ok {
+		c.events = append(c.events, m)
+	}
+}
+
+func (c *capturingEmitter) emitStartupStage(stage string) {
+	c.emit(map[string]any{"type": "startup", "stage": stage})
 }
 
 func Test6004AutoCoolsOnlyThatModel(t *testing.T) {

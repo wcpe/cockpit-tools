@@ -27,6 +27,8 @@ type codebuddyRequestRecord struct {
 	TimestampUnixMs       int64   `json:"timestampUnixMs"`
 	AccountID             string  `json:"accountId,omitempty"`
 	AccountLabel          string  `json:"accountLabel,omitempty"`
+	APIKeyID              string  `json:"apiKeyId,omitempty"`
+	APIKeyLabel           string  `json:"apiKeyLabel,omitempty"`
 	Model                 string  `json:"model"`
 	ClientStream          bool    `json:"clientStream"`
 	Outcome               string  `json:"outcome"` // ok | rate_limited | quota | auth | error | cooling | content_blocked | invalid
@@ -164,11 +166,23 @@ func (s *codebuddyRequestLogStore) List(limit int) []codebuddyRequestRecord {
 }
 
 // ListPage returns a window of records (newest first) for UI pagination.
-func (s *codebuddyRequestLogStore) ListPage(offset, limit int) (records []codebuddyRequestRecord, total int) {
+// apiKey empty = all; otherwise filter by apiKeyId / apiKeyLabel contains.
+func (s *codebuddyRequestLogStore) ListPage(offset, limit int, apiKey string) (records []codebuddyRequestRecord, total int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.load()
-	total = len(s.records)
+	apiKey = strings.TrimSpace(apiKey)
+	filtered := s.records
+	if apiKey != "" {
+		filtered = nil
+		for _, rec := range s.records {
+			if strings.Contains(rec.APIKeyID, apiKey) || strings.Contains(rec.APIKeyLabel, apiKey) ||
+				rec.APIKeyID == apiKey || rec.APIKeyLabel == apiKey {
+				filtered = append(filtered, rec)
+			}
+		}
+	}
+	total = len(filtered)
 	if offset < 0 {
 		offset = 0
 	}
@@ -183,8 +197,67 @@ func (s *codebuddyRequestLogStore) ListPage(offset, limit int) (records []codebu
 		end = total
 	}
 	out := make([]codebuddyRequestRecord, end-offset)
-	copy(out, s.records[offset:end])
+	// Newest first within filtered slice (records are append-ordered oldest→newest).
+	for i := 0; i < end-offset; i++ {
+		out[i] = filtered[total-1-(offset+i)]
+	}
 	return out, total
+}
+
+// StatsByAPIKey aggregates ok/fail/tokens/credit per client API key.
+func (s *codebuddyRequestLogStore) StatsByAPIKey() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.load()
+	type agg struct {
+		id, label string
+		ok, fail  int
+		credit    float64
+		tokens    int64
+		lastAt    string
+	}
+	m := map[string]*agg{}
+	for _, rec := range s.records {
+		key := rec.APIKeyID
+		if key == "" {
+			key = rec.APIKeyLabel
+		}
+		if key == "" {
+			key = "(unknown)"
+		}
+		a := m[key]
+		if a == nil {
+			a = &agg{id: rec.APIKeyID, label: rec.APIKeyLabel}
+			m[key] = a
+		}
+		if a.label == "" {
+			a.label = rec.APIKeyLabel
+		}
+		if rec.Outcome == "ok" {
+			a.ok++
+			a.credit += rec.Credit
+		} else {
+			a.fail++
+		}
+		a.tokens += rec.TotalTokens
+		if rec.Timestamp > a.lastAt {
+			a.lastAt = rec.Timestamp
+		}
+	}
+	out := map[string]any{}
+	for k, v := range m {
+		out[k] = map[string]any{
+			"apiKeyId":    v.id,
+			"apiKeyLabel": v.label,
+			"ok":          v.ok,
+			"fail":        v.fail,
+			"credit":      v.credit,
+			"tokens":      v.tokens,
+			"requests":    v.ok + v.fail,
+			"lastAt":      v.lastAt,
+		}
+	}
+	return out
 }
 
 func (s *codebuddyRequestLogStore) Total() int {
@@ -400,6 +473,24 @@ func extractRequestMeta(payload map[string]any) (maxTokens *int64, temperature, 
 
 func codebuddyRecordRequest(rec codebuddyRequestRecord) {
 	codebuddyRequestLogInit().Append(rec)
+	emitCodebuddyUsageEvent(rec)
+}
+
+func emitCodebuddyUsageEvent(rec codebuddyRequestRecord) {
+	emitter := globalCodebuddyEmitter
+	if emitter == nil {
+		return
+	}
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(payload, &obj); err != nil || obj == nil {
+		obj = map[string]any{}
+	}
+	obj["type"] = "codebuddy_usage"
+	emitter.emit(obj)
 }
 
 // classifyCodebuddyOutcome maps HTTP/body into a stable outcome + reason code.

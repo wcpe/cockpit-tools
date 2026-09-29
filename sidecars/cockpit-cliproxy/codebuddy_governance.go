@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -250,18 +252,10 @@ func (g *codebuddyGovernance) coolSoftModel(id, model string, resetAt time.Time,
 	}
 	until := resetAt
 	if until.IsZero() {
-		// No reset wall-clock: account-level soft backoff without model exemption.
-		if e.CoolKind != codebuddyCoolSoftRate || !now.Before(e.Until) {
-			e.SoftStreak++
-			d := codebuddySoftCooldownBase << (e.SoftStreak - 1)
-			if e.SoftStreak > 4 || d > codebuddySoftCooldownMax || d <= 0 {
-				d = codebuddySoftCooldownMax
-			}
-			e.Until = now.Add(d)
-		}
-		e.CoolKind = codebuddyCoolSoftRate
-		e.Reason = reason
-		e.ModelCooldowns = nil
+		// No upstream reset wall-clock: cool **this model only** for a short
+		// window instead of locking the whole account (do not hammer upstream).
+		until = now.Add(5 * time.Minute)
+		e.ModelCooldowns[model] = codebuddyModelCooldown{Until: until, Reason: reason}
 		e.UpdatedAt = now
 		g.dirty = true
 		g.persistLocked()
@@ -420,33 +414,71 @@ func isModelRateLimit(body string) bool {
 	return raw == codebuddyModelRateCode
 }
 
-// parseRateResetAt extracts "将在 YYYY-MM-DD HH:MM:SS UTC+8 重置" wall-clock.
+// parseRateResetAt extracts rate-limit reset wall-clock.
+// CN: "将在 YYYY-MM-DD HH:MM:SS UTC+8 重置"
+// EN: "will reset at YYYY-MM-DD HH:MM:SS" (global domain; workbuddy2api f044e5c)
 func parseRateResetAt(body string) time.Time {
-	const marker = "将在"
-	idx := strings.Index(body, marker)
-	if idx < 0 {
-		return time.Time{}
-	}
-	rest := body[idx+len(marker):]
-	// Take until 重置 or end.
-	if end := strings.Index(rest, "重置"); end >= 0 {
-		rest = rest[:end]
-	}
-	rest = strings.TrimSpace(rest)
-	rest = strings.TrimSuffix(rest, "UTC+8")
-	rest = strings.TrimSpace(rest)
-	rest = strings.TrimSuffix(rest, "UTC +8")
-	rest = strings.TrimSpace(rest)
+	loc := time.FixedZone("UTC+8", 8*3600)
 	layouts := []string{
 		"2006-01-02 15:04:05",
 		"2006-01-02T15:04:05",
 		"2006-01-02 15:04",
 	}
-	loc := time.FixedZone("UTC+8", 8*3600)
-	for _, layout := range layouts {
-		if ts, err := time.ParseInLocation(layout, rest, loc); err == nil {
-			return ts.UTC()
+	parse := func(raw string) time.Time {
+		raw = strings.TrimSpace(raw)
+		raw = strings.TrimSuffix(raw, "UTC+8")
+		raw = strings.TrimSpace(raw)
+		raw = strings.TrimSuffix(raw, "UTC +8")
+		raw = strings.TrimSpace(raw)
+		for _, layout := range layouts {
+			if ts, err := time.ParseInLocation(layout, raw, loc); err == nil {
+				return ts.UTC()
+			}
 		}
+		return time.Time{}
+	}
+	// Chinese form.
+	if idx := strings.Index(body, "将在"); idx >= 0 {
+		rest := body[idx+len("将在"):]
+		if end := strings.Index(rest, "重置"); end >= 0 {
+			rest = rest[:end]
+		}
+		if ts := parse(rest); !ts.IsZero() {
+			return ts
+		}
+	}
+	// English form: reset at <timestamp> (avoid matching "reset at the end...").
+	lower := strings.ToLower(body)
+	marker := "reset at "
+	idx := strings.Index(lower, marker)
+	for idx >= 0 {
+		rest := body[idx+len(marker):]
+		// Only accept when next chars look like a date.
+		trimmed := strings.TrimSpace(rest)
+		if len(trimmed) >= 19 && trimmed[4] == '-' && trimmed[7] == '-' {
+			// take up to first non-timestamp-ish delimiter
+			end := 0
+			for end < len(trimmed) {
+				ch := trimmed[end]
+				if (ch >= '0' && ch <= '9') || ch == '-' || ch == ':' || ch == 'T' || ch == '.' {
+					end++
+					continue
+				}
+				if ch == ' ' && end < 19 {
+					end++
+					continue
+				}
+				break
+			}
+			if ts := parse(trimmed[:end]); !ts.IsZero() {
+				return ts
+			}
+		}
+		next := strings.Index(lower[idx+len(marker):], marker)
+		if next < 0 {
+			break
+		}
+		idx = idx + len(marker) + next
 	}
 	return time.Time{}
 }
@@ -478,4 +510,92 @@ func parseOptionalInt(raw string) int {
 		return 0
 	}
 	return n
+}
+
+// isClientAborted reports whether the error is a client disconnect / ctx cancel.
+// These must NOT cool accounts or rotate the pool — the client left; the account is fine.
+func isClientAborted(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "context canceled") ||
+		strings.Contains(s, "context cancelled") ||
+		strings.Contains(s, "client closed request") ||
+		strings.Contains(s, "client disconnected")
+}
+
+// codebuddyKeyGovernance cools individual client API keys so one hammering
+// client cannot burn through the whole account pool via repeated aborts.
+type codebuddyKeyGovernance struct {
+	mu     sync.Mutex
+	until  map[string]time.Time
+	streak map[string]int
+}
+
+var codebuddyKeys = &codebuddyKeyGovernance{
+	until:  map[string]time.Time{},
+	streak: map[string]int{},
+}
+
+func (k *codebuddyKeyGovernance) blocked(keyID string) (bool, string) {
+	if keyID == "" {
+		return false, ""
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	until, ok := k.until[keyID]
+	if !ok || !time.Now().Before(until) {
+		return false, ""
+	}
+	return true, fmt.Sprintf("API key cooling until %s", until.Format(time.RFC3339))
+}
+
+func (k *codebuddyKeyGovernance) cool(keyID string, d time.Duration, reason string) {
+	if keyID == "" {
+		return
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.streak[keyID]++
+	// Escalate on repeated aborts: 30s → 2m → 10m cap.
+	shift := k.streak[keyID] - 1
+	if shift > 4 {
+		shift = 4
+	}
+	if d <= 0 {
+		d = 30 * time.Second
+	}
+	eff := d << shift
+	if eff > 10*time.Minute {
+		eff = 10 * time.Minute
+	}
+	k.until[keyID] = time.Now().Add(eff)
+	_ = reason
+}
+
+func (k *codebuddyKeyGovernance) noteOK(keyID string) {
+	if keyID == "" {
+		return
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.streak[keyID] = 0
+	delete(k.until, keyID)
+}
+
+func (k *codebuddyKeyGovernance) status() map[string]string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	now := time.Now()
+	out := map[string]string{}
+	for id, until := range k.until {
+		if now.Before(until) {
+			out[id] = until.UTC().Format(time.RFC3339)
+		}
+	}
+	return out
 }

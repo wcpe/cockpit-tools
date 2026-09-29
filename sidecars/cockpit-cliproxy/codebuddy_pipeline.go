@@ -77,12 +77,38 @@ func applyConversationHeaders(req *http.Request, clientReq *http.Request, client
 	req.Header.Set("X-B3-Spanid", randomHex32()[:16])
 }
 
+var codebuddyModelEfforts = map[string][]string{}
+
+func setCodebuddyModelEfforts(m map[string][]string) {
+	if m == nil {
+		return
+	}
+	// Replace map contents under no lock — rewritten only on manifest reload.
+	for k := range codebuddyModelEfforts {
+		delete(codebuddyModelEfforts, k)
+	}
+	for k, v := range m {
+		codebuddyModelEfforts[strings.ToLower(k)] = v
+	}
+}
+
+func codebuddyEffortsFor(model string) []string {
+	return codebuddyModelEfforts[strings.ToLower(strings.TrimSpace(model))]
+}
+
 // injectDeepSeekThinking: deepseek* models need thinking.type=enabled + effort.
 func injectDeepSeekThinking(payload map[string]any, model string) {
 	if !isDeepSeekModelName(model) {
 		return
 	}
 	effort := normalizeReasoningEffort(payload)
+	// Catalog-driven downgrade when the model declares supportedEfforts.
+	if allowed := codebuddyEffortsFor(model); len(allowed) > 0 {
+		if effort != "" && !containsFold(allowed, effort) {
+			// Pick closest supported tier: prefer highest allowed that is <= requested, else first.
+			effort = pickClosestEffort(allowed)
+		}
+	}
 	// Explicit disabled → strip effort (official behavior).
 	if thinking, ok := payload["thinking"].(map[string]any); ok {
 		if typ, _ := thinking["type"].(string); strings.EqualFold(typ, "disabled") {
@@ -93,6 +119,8 @@ func injectDeepSeekThinking(payload map[string]any, model string) {
 		if typ, _ := thinking["type"].(string); strings.EqualFold(typ, "enabled") {
 			if effort == "" {
 				payload["reasoning_effort"] = "high"
+			} else {
+				payload["reasoning_effort"] = effort
 			}
 			return
 		}
@@ -106,6 +134,39 @@ func injectDeepSeekThinking(payload map[string]any, model string) {
 	if _, ok := payload["thinking"]; !ok {
 		payload["thinking"] = map[string]any{"type": "enabled"}
 	}
+	payload["reasoning_effort"] = effort
+}
+
+func containsFold(list []string, v string) bool {
+	for _, item := range list {
+		if strings.EqualFold(item, v) {
+			return true
+		}
+	}
+	return false
+}
+
+func pickClosestEffort(allowed []string) string {
+	order := []string{"low", "medium", "high", "max"}
+	rank := map[string]int{}
+	for i, o := range order {
+		rank[o] = i
+	}
+	best := ""
+	bestRank := -1
+	for _, a := range allowed {
+		al := strings.ToLower(a)
+		if r, ok := rank[al]; ok && r > bestRank {
+			best = al
+			bestRank = r
+		} else if best == "" {
+			best = al
+		}
+	}
+	if best == "" {
+		return "high"
+	}
+	return best
 }
 
 func isDeepSeekModelName(model string) bool {
@@ -127,8 +188,9 @@ func normalizeReasoningEffort(payload map[string]any) string {
 	return ""
 }
 
-// backfillReasoningContent ensures all assistant messages carry
-// reasoning_content once any has reasoning traces (DeepSeek multi-turn).
+// backfillReasoningContent DeepSeek multi-turn consistency (workbuddy2api #165).
+// Gate: thinkingEnabled || hasTrace. Each assistant message gets a string
+// reasoning_content; mirror reasoning so len(reasoning)>0 tenants accept the body.
 func backfillReasoningContent(payload map[string]any) {
 	model, _ := payload["model"].(string)
 	if !isDeepSeekModelName(model) {
@@ -137,6 +199,26 @@ func backfillReasoningContent(payload map[string]any) {
 	msgs, ok := payload["messages"].([]any)
 	if !ok || len(msgs) == 0 {
 		return
+	}
+	thinkingEnabled := false
+	if th, ok := payload["thinking"].(map[string]any); ok {
+		if typ, _ := th["type"].(string); strings.EqualFold(strings.TrimSpace(typ), "enabled") {
+			thinkingEnabled = true
+		}
+	}
+	// Cockpit injects thinking.enabled for deepseek* in injectDeepSeekThinking
+	// before this runs — treat missing thinking map as enabled for deepseek
+	// (gateway always injects unless user set disabled).
+	if !thinkingEnabled {
+		if th, ok := payload["thinking"].(map[string]any); ok {
+			if typ, _ := th["type"].(string); strings.EqualFold(strings.TrimSpace(typ), "disabled") {
+				thinkingEnabled = false
+			} else {
+				thinkingEnabled = true
+			}
+		} else {
+			thinkingEnabled = true
+		}
 	}
 	hasTrace := false
 	for _, mm := range msgs {
@@ -148,12 +230,16 @@ func backfillReasoningContent(payload map[string]any) {
 			hasTrace = true
 			break
 		}
+		if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+			hasTrace = true
+			break
+		}
 		if _, ok := msg["reasoning_content"]; ok {
 			hasTrace = true
 			break
 		}
 	}
-	if !hasTrace {
+	if !thinkingEnabled && !hasTrace {
 		return
 	}
 	for _, mm := range msgs {
@@ -161,13 +247,27 @@ func backfillReasoningContent(payload map[string]any) {
 		if !ok {
 			continue
 		}
-		if _, ok := msg["reasoning_content"]; ok {
+		role, _ := msg["role"].(string)
+		if role != "assistant" {
 			continue
 		}
+		rc, hasRC := msg["reasoning_content"].(string)
+		if !hasRC {
+			if r, ok := msg["reasoning"].(string); ok {
+				rc = r
+			} else {
+				rc = ""
+			}
+			msg["reasoning_content"] = rc
+		}
+		// Mirror reasoning for tenants validating len(reasoning)>0.
 		if r, ok := msg["reasoning"].(string); ok && r != "" {
-			msg["reasoning_content"] = r
+			continue
+		}
+		if rc != "" {
+			msg["reasoning"] = rc
 		} else {
-			msg["reasoning_content"] = ""
+			msg["reasoning"] = " "
 		}
 	}
 }
@@ -176,15 +276,50 @@ const codebuddyNeutralSystemPrompt = "You are a helpful AI assistant."
 
 // applySystemPromptMode:
 //   - "custom": replace system/developer with gateway-owned prompt
+//   - "append": insert gateway system after the leading system/developer block;
+//     existing messages stay verbatim. Degraded retry degrades append → replace
+//     (workbuddy2api issue #129: append with original fingerprints retried is a
+//     deterministic re-hit; replace is the minimal rescue).
 //   - "passthrough" (default): keep client system; degraded retry injects neutral
 func applySystemPromptMode(payload map[string]any, mode string, degraded bool) {
-	if mode == "custom" {
+	if mode == "custom" || degraded {
+		// degraded covers passthrough + append (append degrades to replace).
 		rewriteSystemMessages(payload, codebuddyNeutralSystemPrompt, true)
 		return
 	}
-	if degraded {
-		rewriteSystemMessages(payload, codebuddyNeutralSystemPrompt, true)
+	if mode == "append" {
+		appendSystemMessages(payload, codebuddyNeutralSystemPrompt)
 	}
+}
+
+// appendSystemMessages inserts a gateway system message after the leading
+// contiguous system/developer block. All existing messages stay verbatim.
+// Leading block length 0 → insert at front.
+func appendSystemMessages(payload map[string]any, systemText string) {
+	msgs, ok := payload["messages"].([]any)
+	if !ok {
+		payload["messages"] = []any{
+			map[string]any{"role": "system", "content": systemText},
+		}
+		return
+	}
+	insertAt := 0
+	for _, mm := range msgs {
+		msg, ok := mm.(map[string]any)
+		if !ok {
+			break
+		}
+		role, _ := msg["role"].(string)
+		if role != "system" && role != "developer" {
+			break
+		}
+		insertAt++
+	}
+	out := make([]any, 0, len(msgs)+1)
+	out = append(out, msgs[:insertAt]...)
+	out = append(out, map[string]any{"role": "system", "content": systemText})
+	out = append(out, msgs[insertAt:]...)
+	payload["messages"] = out
 }
 
 func rewriteSystemMessages(payload map[string]any, systemText string, dropDeveloper bool) {

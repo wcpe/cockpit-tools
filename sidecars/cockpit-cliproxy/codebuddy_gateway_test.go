@@ -410,6 +410,54 @@ func TestCodebuddyFallsBackToNextAccount(t *testing.T) {
 	}
 }
 
+func TestCodebuddyConversationKeyStickyFallbacks(t *testing.T) {
+	// prompt_cache_key
+	payload := map[string]any{"prompt_cache_key": "sess-abc", "messages": []any{}}
+	if k := codebuddyConversationKeyFrom(nil, payload); k != "pck:sess-abc" {
+		t.Fatalf("pck key=%q", k)
+	}
+	// user_id suppresses hist fallback
+	payload2 := map[string]any{
+		"user_id": "u1",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hello sticky"},
+		},
+	}
+	if k := codebuddyConversationKeyFrom(nil, payload2); k != "" {
+		t.Fatalf("user_id should suppress sticky, got %q", k)
+	}
+	// hist fallback without user_id
+	payload3 := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hello sticky"},
+		},
+	}
+	if k := codebuddyConversationKeyFrom(nil, payload3); !strings.HasPrefix(k, "hist:") {
+		t.Fatalf("hist key=%q", k)
+	}
+	// image content still produces a signature
+	payload4 := map[string]any{
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AAAA"}},
+				},
+			},
+		},
+	}
+	if k := codebuddyConversationKeyFrom(nil, payload4); !strings.HasPrefix(k, "hist:") {
+		t.Fatalf("image hist key=%q", k)
+	}
+	// turn-level request id rotates with turn text
+	id1 := deriveTurnRequestID("conv:x", "u1:first")
+	id2 := deriveTurnRequestID("conv:x", "u1:second")
+	id3 := deriveTurnRequestID("conv:x", "u1:first")
+	if id1 == "" || id1 == id2 || id1 != id3 {
+		t.Fatalf("turn ids %s %s %s", id1, id2, id3)
+	}
+}
+
 func TestCodebuddyModelsEndpoint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	apiKey := codebuddyTestAPIKey("acct_1")

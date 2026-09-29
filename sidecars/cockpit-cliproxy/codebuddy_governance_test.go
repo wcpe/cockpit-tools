@@ -108,6 +108,22 @@ func TestInjectDeepSeekThinking(t *testing.T) {
 	}
 }
 
+func TestParseRateResetEnglish(t *testing.T) {
+	body := `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at 2026-09-18 16:06:52 UTC+8, alternatively, you can switch to the other models to continue using it."}`
+	ts := parseRateResetAt(body)
+	if ts.IsZero() {
+		t.Fatal("english reset time should parse")
+	}
+	if ts.Year() != 2026 || ts.Month() != time.September || ts.Day() != 18 {
+		t.Fatalf("parsed %v", ts)
+	}
+	// Natural language must not match.
+	body2 := `{"code":6004,"msg":"usage will reset at the end of the day"}`
+	if !parseRateResetAt(body2).IsZero() {
+		t.Fatal("natural language should not parse")
+	}
+}
+
 func TestHardQuotaNext0400(t *testing.T) {
 	next := codebuddyNext0400CST()
 	if next.Before(time.Now().UTC()) {
@@ -115,5 +131,82 @@ func TestHardQuotaNext0400(t *testing.T) {
 	}
 	if next.After(time.Now().UTC().Add(25 * time.Hour)) {
 		t.Fatal("next 04:00 CST should be within a day")
+	}
+}
+
+func TestApplySystemPromptModeAppendInsertsAfterLeadingBlock(t *testing.T) {
+	payload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "system", "content": "client-a"},
+			map[string]any{"role": "developer", "content": "client-b"},
+			map[string]any{"role": "user", "content": "hi"},
+		},
+	}
+	applySystemPromptMode(payload, "append", false)
+	msgs, _ := payload["messages"].([]any)
+	if len(msgs) != 4 {
+		t.Fatalf("messages len = %d", len(msgs))
+	}
+	roles := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		roles = append(roles, mm["role"].(string))
+	}
+	want := []string{"system", "developer", "system", "user"}
+	for i, r := range roles {
+		if r != want[i] {
+			t.Fatalf("roles = %v, want %v", roles, want)
+		}
+	}
+	// Leading client systems stay verbatim.
+	first, _ := msgs[0].(map[string]any)
+	if first["content"] != "client-a" {
+		t.Fatalf("client system rewritten: %v", first["content"])
+	}
+}
+
+func TestApplySystemPromptModeAppendDegradedReplaces(t *testing.T) {
+	payload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "system", "content": "fingerprint-bait"},
+			map[string]any{"role": "user", "content": "hi"},
+		},
+	}
+	applySystemPromptMode(payload, "append", true)
+	msgs, _ := payload["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("degraded append should replace, messages = %#v", msgs)
+	}
+	sys, _ := msgs[0].(map[string]any)
+	if sys["content"] != codebuddyNeutralSystemPrompt {
+		t.Fatalf("degraded content = %v", sys["content"])
+	}
+}
+
+func TestEnsureCodebuddyUsageTotal(t *testing.T) {
+	u := map[string]any{"prompt_tokens": float64(5), "completion_tokens": float64(3)}
+	out := ensureCodebuddyUsageTotal(u)
+	if out["total_tokens"] != float64(8) {
+		t.Fatalf("total_tokens = %v", out["total_tokens"])
+	}
+	if _, ok := u["total_tokens"]; ok {
+		t.Fatal("input map must not be mutated")
+	}
+	// Already has total → unchanged.
+	u2 := map[string]any{"total_tokens": float64(9), "prompt_tokens": float64(5)}
+	if ensureCodebuddyUsageTotal(u2)["total_tokens"] != float64(9) {
+		t.Fatal("existing total should be preserved")
+	}
+}
+
+func TestJsonLooksComplete(t *testing.T) {
+	if !jsonLooksComplete(`{"city":"北京"}`) {
+		t.Fatal("complete object should pass")
+	}
+	if jsonLooksComplete(`{"ci`) {
+		t.Fatal("truncated object should fail")
+	}
+	if !jsonLooksComplete("") {
+		t.Fatal("empty args (no-param tool) should pass")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -41,22 +42,29 @@ func normalizeSessionKey(s string) string {
 }
 
 // codebuddyConversationKeyFrom extracts a stable conversation key.
-// Priority:
-//  1. X-Conversation-ID header / body.conversationId
-//  2. History-prefix hash (messages excluding the last user turn)
-//  3. First user message hash (single-turn start still sticks for follow-ups
-//     that grow the history prefix)
+// Priority (aligned with workbuddy2api session.ExtractKey + sticky fallback):
+//  1. X-Conversation-ID header / body.conversation_id / body.conversationId
+//  2. body.prompt_cache_key (OpenAI prefix-cache / pi-ai clients)
+//  3. History-prefix hash (messages excluding the last user turn)
+//  4. First user message signature (StickyFallbackKey semantics; suppressed
+//     when metadata.user_id / user_id is present — anti-monopoly)
 func codebuddyConversationKeyFrom(clientHeader http.Header, payload map[string]any) string {
 	var convID string
 	if clientHeader != nil {
 		convID = normalizeSessionKey(clientHeader.Get("X-Conversation-ID"))
 	}
 	if payload != nil && convID == "" {
-		convID = normalizeSessionKey(stringValue(payload["conversationId"]))
-		if convID == "" {
-			if meta, ok := payload["metadata"].(map[string]any); ok {
-				convID = normalizeSessionKey(stringValue(meta["conversation_id"]))
+		if meta, ok := payload["metadata"].(map[string]any); ok {
+			convID = normalizeSessionKey(stringValue(meta["conversation_id"]))
+			if convID == "" {
+				convID = normalizeSessionKey(stringValue(meta["conversationId"]))
 			}
+		}
+		if convID == "" {
+			convID = normalizeSessionKey(stringValue(payload["conversation_id"]))
+		}
+		if convID == "" {
+			convID = normalizeSessionKey(stringValue(payload["conversationId"]))
 		}
 	}
 	if convID != "" {
@@ -65,10 +73,72 @@ func codebuddyConversationKeyFrom(clientHeader http.Header, payload map[string]a
 	if payload == nil {
 		return ""
 	}
+	// prompt_cache_key: OpenAI prefix-cache key, same conversation semantics.
+	if pck := normalizeSessionKey(stringValue(payload["prompt_cache_key"])); pck != "" {
+		return "pck:" + pck
+	}
+	if hasCodebuddyUserID(payload) {
+		// user_id is too coarse for sticky (anti-monopoly); fall back to RR.
+		return ""
+	}
 	if h := promptHistoryHash(payload); h != "" {
 		return "hist:" + h
 	}
 	return ""
+}
+
+func hasCodebuddyUserID(payload map[string]any) bool {
+	if payload == nil {
+		return false
+	}
+	if stringValue(payload["user_id"]) != "" || stringValue(payload["userId"]) != "" {
+		return true
+	}
+	if meta, ok := payload["metadata"].(map[string]any); ok {
+		if stringValue(meta["user_id"]) != "" || stringValue(meta["userId"]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// contentSignature for sticky/history keys: text parts concatenated; non-text
+// parts contribute [type:sha256/8] so pure-image turns still stick (workbuddy2api G1).
+func codebuddyContentSignature(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		var b strings.Builder
+		hasNonText := false
+		for _, part := range c {
+			m, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := m["type"].(string)
+			if typ == "" || typ == "text" {
+				if text, ok := m["text"].(string); ok {
+					b.WriteString(text)
+				}
+				continue
+			}
+			hasNonText = true
+			raw, _ := json.Marshal(m)
+			sum := sha256.Sum256(raw)
+			b.WriteString("\n[" + typ + ":" + hex.EncodeToString(sum[:4]) + "]\n")
+		}
+		out := b.String()
+		if !hasNonText {
+			return out
+		}
+		return strings.TrimSpace(out)
+	case nil:
+		return ""
+	default:
+		raw, _ := json.Marshal(c)
+		return string(raw)
+	}
 }
 
 // promptHistoryHash identifies a conversation by its first user message so
@@ -87,19 +157,12 @@ func promptHistoryHash(payload map[string]any) string {
 		if role != "user" {
 			continue
 		}
-		var text string
-		switch c := m["content"].(type) {
-		case string:
-			text = c
-		default:
-			rawC, _ := json.Marshal(c)
-			text = string(rawC)
-		}
-		text = strings.TrimSpace(text)
+		text := strings.TrimSpace(codebuddyContentSignature(m["content"]))
 		if text == "" {
-			continue
+			// First user message has no signature → do not walk further
+			// (stable key for the whole session; avoid drift).
+			return ""
 		}
-		// Cap so huge first messages still hash cheaply but uniquely enough.
 		if len(text) > 2048 {
 			text = text[:2048]
 		}
@@ -109,10 +172,55 @@ func promptHistoryHash(payload map[string]any) string {
 	return ""
 }
 
+// codebuddyTurnSignature keys the current user turn (last user message) for
+// turn-level conversationRequestID (#170).
+func codebuddyTurnSignature(payload map[string]any) string {
+	msgs, ok := payload["messages"].([]any)
+	if !ok {
+		return ""
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m, ok := msgs[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := m["role"].(string)
+		if role != "user" {
+			continue
+		}
+		sig := strings.TrimSpace(codebuddyContentSignature(m["content"]))
+		if sig == "" {
+			return ""
+		}
+		if len(sig) > 2048 {
+			sig = sig[:2048]
+		}
+		return fmt.Sprintf("u%d:%s", i, sig)
+	}
+	return ""
+}
+
 // deriveStableRequestID produces a process-stable 32-hex id from a session key
 // (aligned with workbuddy2api session.RequestIDForKey).
 func deriveStableRequestID(sessionKey string) string {
 	sum := sha256.Sum256([]byte("wb2a:req|" + sessionKey))
+	return hex.EncodeToString(sum[:16])
+}
+
+// deriveTurnRequestID: session-scoped turn-level aggregation key (#170).
+// Same turn text in different sessions must not collide → sessKey in the mix.
+func deriveTurnRequestID(sessionKey, turnSig string) string {
+	if turnSig == "" {
+		if sessionKey != "" {
+			return deriveStableRequestID(sessionKey)
+		}
+		return ""
+	}
+	key := turnSig
+	if sessionKey != "" {
+		key = sessionKey + ":" + turnSig
+	}
+	sum := sha256.Sum256([]byte("wb2a:turn|" + key))
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -166,6 +274,15 @@ func (a *codebuddySessionAffinity) UnbindAccount(accountID string) {
 	a.mu.Unlock()
 }
 
+// ClearAll drops every sticky binding (manual reset from UI).
+func (a *codebuddySessionAffinity) ClearAll() int {
+	a.mu.Lock()
+	n := len(a.binds)
+	a.binds = map[string]codebuddySessionBind{}
+	a.mu.Unlock()
+	return n
+}
+
 func (a *codebuddySessionAffinity) Snapshot() map[string]string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -193,13 +310,18 @@ func pickUpstreamForSession(
 	if !ok {
 		return order, ""
 	}
+	pool := codebuddyPoolInit()
 	for i, u := range order {
 		if u == nil || u.ID != boundID {
 			continue
 		}
 		if available, _ := gov.available(u.ID, model); !available {
 			codebuddyAffinity.Unbind(sessionKey)
-			return order, ""
+			return order, boundID // keep stickyID so caller can fail-fast
+		}
+		if available, _ := pool.Available(u.ID, model); !available {
+			codebuddyAffinity.Unbind(sessionKey)
+			return order, boundID
 		}
 		if i == 0 {
 			return order, u.ID

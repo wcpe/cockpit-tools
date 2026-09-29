@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -102,34 +103,53 @@ func filterCodebuddyUpstreams(upstreams []*codebuddyUpstreamSpec) []*codebuddyUp
 }
 
 // codebuddyCatalogForAPIKey merges the model list of every scoped upstream.
+// Disabled operator models are omitted (aligned with chat rejection).
 func codebuddyCatalogForAPIKey(m *manifest, spec *apiKeySpec) []string {
 	upstreams := codebuddyUpstreamsForAPIKey(m, spec)
+	night := codebuddyNightFreeFromManifest(m)
+	now := time.Now()
 	models := make([]string, 0)
 	seen := make(map[string]struct{})
 	anyAccountCatalog := false
+	appendModel := func(model string) {
+		key := strings.ToLower(strings.TrimSpace(model))
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		if codebuddyModelDisabled(m, model) {
+			return
+		}
+		if ok, _ := night.AllowModel(model, now); !ok {
+			return
+		}
+		seen[key] = struct{}{}
+		models = append(models, model)
+	}
 	for _, upstream := range upstreams {
 		if len(upstream.ModelIDs) == 0 {
 			continue
 		}
 		anyAccountCatalog = true
 		for _, model := range upstream.ModelIDs {
-			key := strings.ToLower(model)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			models = append(models, model)
+			appendModel(model)
 		}
 	}
 	if !anyAccountCatalog {
-		models = append(models, codebuddyDefaultModelIDs...)
-	}
-	if prefix := strings.Trim(strings.TrimSpace(spec.ModelPrefix), "/"); prefix != "" {
-		prefixed := make([]string, 0, len(models))
-		for _, model := range models {
-			prefixed = append(prefixed, prefix+"/"+model)
+		for _, id := range codebuddyDefaultModelIDs {
+			appendModel(id)
 		}
-		return prefixed
+	}
+	if spec != nil {
+		if prefix := strings.Trim(strings.TrimSpace(spec.ModelPrefix), "/"); prefix != "" {
+			prefixed := make([]string, 0, len(models))
+			for _, model := range models {
+				prefixed = append(prefixed, prefix+"/"+model)
+			}
+			return prefixed
+		}
 	}
 	return models
 }
@@ -148,12 +168,41 @@ func codebuddyUpstreamSupportsModel(upstream *codebuddyUpstreamSpec, model strin
 
 // handleCodebuddyModels answers GET /v1/models for a CodeBuddy key.
 func (s *relayServer) handleCodebuddyModels(c *gin.Context, spec *apiKeySpec) {
-	c.JSON(http.StatusOK, codebuddyModelsResponse(codebuddyCatalogForAPIKey(s.manifest, spec)))
+	ids := codebuddyCatalogForAPIKey(s.manifest, spec)
+	if s.manifest != nil && len(s.manifest.DisabledModels) > 0 {
+		filtered := ids[:0]
+		for _, id := range ids {
+			if !codebuddyModelDisabled(s.manifest, id) {
+				filtered = append(filtered, id)
+			}
+		}
+		ids = filtered
+	}
+	c.JSON(http.StatusOK, codebuddyModelsResponse(ids))
 }
 
-// handleCodebuddyStatus exposes cooling / rate_limited_models ledger.
+func codebuddyLooksClientAborted(message string) bool {
+	lowerMsg := strings.ToLower(message)
+	return strings.Contains(lowerMsg, "context canceled") ||
+		strings.Contains(lowerMsg, "context cancelled") ||
+		strings.Contains(lowerMsg, "client closed")
+}
+
+// handleCodebuddySessionsClear drops sticky session bindings.
+func (s *relayServer) handleCodebuddySessionsClear(c *gin.Context) {
+	cleared := codebuddyAffinity.ClearAll()
+	c.JSON(http.StatusOK, gin.H{
+		"cleared": cleared,
+		"message": fmt.Sprintf("cleared %d sticky session binding(s)", cleared),
+	})
+}
+
 func (s *relayServer) handleCodebuddyStatus(c *gin.Context) {
 	gov := codebuddyGovernanceInit()
+	pool := codebuddyPoolInit()
+	if s.manifest != nil {
+		pool.SyncFromManifest(s.manifest.CodebuddyUpstreams)
+	}
 	accounts := gov.statusLedger()
 	summary := gin.H{
 		"promptMode": codebuddyPromptMode(),
@@ -176,12 +225,132 @@ func (s *relayServer) handleCodebuddyStatus(c *gin.Context) {
 		rateLimited = []map[string]any{}
 	}
 	summary["rateLimitedModels"] = rateLimited
+	// Cooling rows for UI: account + model + until.
+	type coolRow struct {
+		AccountID    string `json:"accountId"`
+		AccountLabel string `json:"accountLabel"`
+		Model        string `json:"model"`
+		Kind         string `json:"kind"`
+		Until        string `json:"until"`
+		Reason       string `json:"reason,omitempty"`
+	}
+	var cooling []coolRow
+	for _, acc := range accounts {
+		if models, ok := acc["rateLimitedModels"].([]map[string]any); ok {
+			for _, m := range models {
+				modelName, _ := m["model"].(string)
+				until, _ := m["until"].(string)
+				cooling = append(cooling, coolRow{
+					AccountID: fmt.Sprint(acc["id"]), AccountLabel: fmt.Sprint(acc["label"]),
+					Model: modelName, Kind: "model", Until: until, Reason: fmt.Sprint(m["reason"]),
+				})
+			}
+		}
+		if until, ok := acc["until"].(string); ok && until != "" {
+			cooling = append(cooling, coolRow{
+				AccountID: fmt.Sprint(acc["id"]), AccountLabel: fmt.Sprint(acc["label"]),
+				Model: "*", Kind: fmt.Sprint(acc["coolKind"]), Until: until, Reason: fmt.Sprint(acc["reason"]),
+			})
+		}
+	}
+	if cooling == nil {
+		cooling = []coolRow{}
+	}
+	summary["cooling"] = cooling
+	summary["sessionAffinity"] = codebuddyAffinity.Snapshot()
 	// Keep the status payload small: ledger tab uses /requests for paging.
 	summary["recentRequests"] = codebuddyRequestLogInit().List(20)
 	summary["requestStats"] = codebuddyRequestLogInit().StatsByAccountModel()
 	summary["modelUsage"] = codebuddyRequestLogInit().ModelUsageStats()
 	summary["sessionAffinityCount"] = len(codebuddyAffinity.Snapshot())
+	summary["apiKeyCooling"] = codebuddyKeys.status()
+	summary["pool"] = pool.Ledger()
+	if s.manifest != nil {
+		summary["modelCredits"] = s.manifest.ModelCredits
+		summary["modelEfforts"] = s.manifest.ModelEfforts
+		summary["disabledModels"] = s.manifest.DisabledModels
+		setCodebuddyModelEfforts(s.manifest.ModelEfforts)
+	}
+	summary["costExplore"] = CostExploreConfig()
+	summary["nightFree"] = codebuddyNightFreeFromManifest(s.manifest).Status(time.Now())
+	summary["catalog"] = BuildCatalog(s.manifest)
+	summary["apiKeyStats"] = codebuddyRequestLogInit().StatsByAPIKey()
+	if s.manifest != nil {
+		summary["modelGroups"] = s.manifest.ModelGroups
+		summary["accountModelCatalogs"] = s.manifest.AccountModelCatalogs
+		type accCat struct {
+			AccountID string            `json:"accountId"`
+			Label     string            `json:"label"`
+			Models    []map[string]any  `json:"models"`
+			Credits   map[string]string `json:"credits,omitempty"`
+			AlwaysFree []string         `json:"alwaysFreeModels,omitempty"`
+			NightFree  []string         `json:"nightOnlyFreeModels,omitempty"`
+		}
+		var accCats []accCat
+		for _, u := range s.manifest.CodebuddyUpstreams {
+			credits := map[string]string{}
+			for _, row := range u.ModelCatalog {
+				if id, _ := row["id"].(string); id != "" {
+					if c, _ := row["credits"].(string); c != "" {
+						credits[id] = c
+					}
+				}
+			}
+			accCats = append(accCats, accCat{
+				AccountID:  u.ID,
+				Label:      u.Label,
+				Models:     u.ModelCatalog,
+				Credits:    credits,
+				AlwaysFree: u.AlwaysFreeModels,
+				NightFree:  u.NightOnlyFreeModels,
+			})
+		}
+		if len(accCats) > 0 {
+			summary["accountCatalogs"] = accCats
+		}
+	}
 	c.JSON(http.StatusOK, summary)
+}
+
+// handleCodebuddyCatalog returns the merged model catalog (params + free/paid + usage).
+func (s *relayServer) handleCodebuddyCatalog(c *gin.Context) {
+	rows := BuildCatalog(s.manifest)
+	night := codebuddyNightFreeFromManifest(s.manifest)
+	now := time.Now()
+	// Annotate night-free models.
+	for i := range rows {
+		if night.IsNightFreeModel(rows[i].ID) {
+			in := night.InNightWindow(now)
+			rows[i].Tags = append(rows[i].Tags, "night-free")
+			if !in {
+				rows[i].Disabled = true
+				rows[i].Description = strings.TrimSpace(rows[i].Description + " [窗外禁用，防计费]")
+			} else {
+				free := true
+				rows[i].FreeObserved = &free
+			}
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"models":       rows,
+		"disabled":     s.manifest.DisabledModels,
+		"costExplore":  CostExploreConfig(),
+		"nightFree":    night.Status(now),
+		"modelCredits": s.manifest.ModelCredits,
+	})
+}
+
+func codebuddyModelDisabled(m *manifest, model string) bool {
+	if m == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(model))
+	for _, id := range m.DisabledModels {
+		if strings.ToLower(strings.TrimSpace(id)) == lower {
+			return true
+		}
+	}
+	return false
 }
 
 func formatOptionalTime(t time.Time) string {
@@ -212,7 +381,8 @@ func (s *relayServer) handleCodebuddyRequests(c *gin.Context) {
 		offset = codebuddyRequestLogMax
 	}
 	store := codebuddyRequestLogInit()
-	records, total := store.ListPage(offset, limit)
+	apiKeyFilter := strings.TrimSpace(c.Query("apiKey"))
+	records, total := store.ListPage(offset, limit, apiKeyFilter)
 	c.JSON(http.StatusOK, gin.H{
 		"total":      total,
 		"offset":     offset,
@@ -220,6 +390,8 @@ func (s *relayServer) handleCodebuddyRequests(c *gin.Context) {
 		"records":    records,
 		"stats":      store.StatsByAccountModel(),
 		"modelUsage": store.ModelUsageStats(),
+		"apiKeyStats": store.StatsByAPIKey(),
+		"apiKey":     apiKeyFilter,
 	})
 }
 
@@ -241,6 +413,17 @@ func codebuddyModelsResponse(models []string) gin.H {
 // the client yet.
 func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clientBody []byte) {
 	gov := codebuddyGovernanceInit()
+	keyID := ""
+	if spec != nil {
+		keyID = spec.ID
+		if keyID == "" {
+			keyID = spec.Label
+		}
+	}
+	if blocked, reason := codebuddyKeys.blocked(keyID); blocked {
+		writeAPIError(c, http.StatusTooManyRequests, reason, "api_key_cooling")
+		return
+	}
 	upstreams := codebuddyUpstreamsForAPIKey(s.manifest, spec)
 	if len(upstreams) == 0 {
 		writeAPIError(c, http.StatusServiceUnavailable,
@@ -253,10 +436,40 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 		writeAPIError(c, http.StatusBadRequest, "model is required", "invalid_request")
 		return
 	}
+	// Realm prefix routing: cn:/global: selects matching upstreams.
+	realmPref, bareModel := codebuddySplitRealmModel(model)
+	if bareModel != "" {
+		model = bareModel
+	}
+	if realmPref != "" {
+		filtered := upstreams[:0]
+		for _, u := range upstreams {
+			r := strings.ToLower(u.Realm)
+			if r == "" {
+				r = codebuddyInferRealm(u)
+			}
+			if r == realmPref {
+				filtered = append(filtered, u)
+			}
+		}
+		if len(filtered) > 0 {
+			upstreams = filtered
+		}
+	}
 
 	catalog := codebuddyCatalogForAPIKey(s.manifest, spec)
 	if len(catalog) > 0 && !stringSliceContainsFold(catalog, model) {
 		writeAPIError(c, http.StatusNotFound, fmt.Sprintf("model %s not found", model), "model_not_found")
+		return
+	}
+	if codebuddyModelDisabled(s.manifest, model) {
+		writeAPIError(c, http.StatusNotFound,
+			fmt.Sprintf("model %s is disabled by operator", model), "model_disabled")
+		return
+	}
+	night := codebuddyNightFreeFromManifest(s.manifest)
+	if ok, reason := night.AllowModel(model, time.Now()); !ok {
+		writeAPIError(c, http.StatusForbidden, reason, "model_outside_free_window")
 		return
 	}
 
@@ -266,14 +479,19 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 		return
 	}
 
-	// Conversation aggregation key is stable across account rotation/retry.
-	// Client-provided X-Conversation-Request-ID wins; otherwise derive a stable
-	// id from the session key (workbuddy2api RequestIDForKey semantics) so the
-	// same conversation does not fragment into per-request IDs.
+	// Conversation aggregation key (#170 turn-level, aligned with official CLI):
+	// client X-Conversation-Request-ID wins; otherwise turn-level key when a user
+	// turn exists (same turn retries share the key; next user message rotates);
+	// session-stable fallback when no turn signature; else request-random.
 	conversationRequestID := strings.TrimSpace(c.Request.Header.Get("X-Conversation-Request-ID"))
 	sessionKey := codebuddyConversationKeyFrom(c.Request.Header, payload)
+	// Sticky key = session key (conv/pck/hist); already suppresses user_id fallbacks.
+	stickyKey := sessionKey
+	turnSig := codebuddyTurnSignature(payload)
 	if conversationRequestID == "" {
-		if sessionKey != "" {
+		if turnSig != "" {
+			conversationRequestID = deriveTurnRequestID(sessionKey, turnSig)
+		} else if sessionKey != "" {
 			conversationRequestID = deriveStableRequestID(sessionKey)
 		} else {
 			conversationRequestID = randomHex32()
@@ -300,18 +518,68 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 		rec.UpstreamStream = true
 		rec.Attempt = tried + 1
 		rec.DegradedPrompt = degradedApplied
+		rec.APIKeyID = keyID
+		if spec != nil {
+			rec.APIKeyLabel = spec.Label
+			if rec.APIKeyLabel == "" {
+				rec.APIKeyLabel = spec.ID
+			}
+		}
 		return rec
 	}
 
-	order := codebuddySelectionOrder(s.manifest, upstreams)
+	order := codebuddySelectionOrder(s.manifest, upstreams, model)
 	var stickyAccountID string
-	order, stickyAccountID = pickUpstreamForSession(order, sessionKey, gov, model)
+	order, stickyAccountID = pickUpstreamForSession(order, stickyKey, gov, model)
+	pool := codebuddyPoolInit()
 	if stickyAccountID != "" {
 		s.emitExecutorDiagnostic(c, "codebuddy_session_sticky", model, stickyAccountID, time.Now(),
 			"reuse conversation-bound account for prompt cache")
 	}
+	if pool.WafIPActive() {
+		writeAPIError(c, http.StatusServiceUnavailable,
+			"upstream WAF blocked this egress IP; retry after cool-down", "waf_ip_blocked")
+		return
+	}
+
+	// Sticky session: if the bound account is cooling, UNBIND and rotate to the
+	// next healthy account (do not pin the client to a cooling account, and do
+	// not 503 when other accounts can serve). Only when every candidate is
+	// cooling do we refuse without calling upstream.
+	if stickyAccountID != "" {
+		if ok, reason := gov.available(stickyAccountID, model); !ok {
+			codebuddyAffinity.Unbind(stickyKey)
+			s.emitExecutorDiagnostic(c, "codebuddy_sticky_unbind", model, stickyAccountID, time.Now(), reason)
+		} else if ok, reason := pool.Available(stickyAccountID, model); !ok {
+			codebuddyAffinity.Unbind(stickyKey)
+			s.emitExecutorDiagnostic(c, "codebuddy_sticky_unbind", model, stickyAccountID, time.Now(), reason)
+		}
+	}
+
+	// Pre-count usable candidates; if none, do not touch upstream at all.
+	usable := 0
+	for _, u := range order {
+		if u == nil || !codebuddyUpstreamSupportsModel(u, model) {
+			continue
+		}
+		if ok, _ := gov.available(u.ID, model); !ok {
+			continue
+		}
+		if ok, _ := pool.Available(u.ID, model); !ok {
+			continue
+		}
+		usable++
+	}
+	if usable == 0 {
+		writeAPIError(c, http.StatusServiceUnavailable,
+			"all accounts cooling for this model; not calling upstream", "all_accounts_cooling")
+		return
+	}
+
 	var lastStatus int
 	var lastMessage string
+	rotateAttempt := 0
+	hitRateLimit := false
 	for _, upstream := range order {
 		if !codebuddyUpstreamSupportsModel(upstream, model) {
 			continue
@@ -330,32 +598,51 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 				LatencyMs:             time.Since(attemptStarted).Milliseconds(),
 				ConversationRequestID: conversationRequestID,
 			}, upstream))
+			if stickyKey != "" {
+				codebuddyAffinity.Unbind(stickyKey)
+			}
 			continue
+		}
+		if ok, reason := pool.Available(upstream.ID, model); !ok {
+			s.emitExecutorDiagnostic(c, "codebuddy_pool_skip", model, upstream.ID, attemptStarted, reason)
+			codebuddyRecordRequest(attachMeta(codebuddyRequestRecord{
+				AccountID: upstream.ID, AccountLabel: upstream.Label, Model: model,
+				ClientStream: clientWantsStream, Outcome: "cooling",
+				ReasonCode: "pool", Message: reason,
+				LatencyMs: time.Since(attemptStarted).Milliseconds(),
+				ConversationRequestID: conversationRequestID,
+			}, upstream))
+			if stickyKey != "" {
+				codebuddyAffinity.Unbind(stickyKey)
+			}
+			continue
+		}
+		// After a rate-limit on this request, do not keep burning the pool.
+		if hitRateLimit && rotateAttempt >= 1 {
+			break
 		}
 
 		bodyForAttempt := payload
-		if degradedApplied {
-			// Clone map shallowly then rewrite system.
-			cloned := make(map[string]any, len(payload))
-			for k, v := range payload {
-				cloned[k] = v
-			}
-			applySystemPromptMode(cloned, promptMode, true)
-			bodyForAttempt = cloned
-		}
-		upstreamBody, err := codebuddyEncodeRequestBody(bodyForAttempt, model, upstream, c, conversationRequestID)
+		// Prompt policy is applied once inside encode (degraded=degradedApplied).
+		// Pre-applying here then re-applying in encode would double-insert append.
+		upstreamBody, err := codebuddyEncodeRequestBody(bodyForAttempt, model, upstream, c, conversationRequestID, degradedApplied)
 		if err != nil {
 			writeAPIError(c, http.StatusBadRequest, "failed to encode request body", "invalid_request")
 			return
 		}
 
+		pool.Acquire(upstream.ID)
 		status, message, rawBody, resp := s.openCodebuddyStream(c, upstream, upstreamBody, model)
+		pool.Release(upstream.ID)
 		latencyMs := time.Since(attemptStarted).Milliseconds()
 		if resp != nil {
+
 			defer resp.Body.Close()
 			gov.noteSuccess(upstream.ID)
-			if sessionKey != "" {
-				codebuddyAffinity.Bind(sessionKey, upstream.ID)
+			pool.NoteSuccess(upstream.ID)
+			codebuddyKeys.noteOK(keyID)
+			if stickyKey != "" {
+				codebuddyAffinity.Bind(stickyKey, upstream.ID)
 			}
 			rec := attachMeta(codebuddyRequestRecord{
 				AccountID:             upstream.ID,
@@ -377,6 +664,7 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 				if usage.HasCredit {
 					rec.Credit = usage.Credit
 					rec.HasCredit = true
+					pool.NoteModelCost(upstream.ID, model, usage.Credit, int(usage.TotalTokens))
 				}
 				rec.CachedTokens = usage.CachedTokens
 				rec.CacheWriteTokens = usage.CacheWriteTokens
@@ -385,7 +673,47 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 			codebuddyRecordRequest(rec)
 			return
 		}
+		// Client aborted / timed out: do NOT cool the account or rotate the pool.
+		// (用户中断/超时不是账号故障，记冷却会误伤并导致后续一直 503。)
+		if codebuddyLooksClientAborted(message) || c.Request.Context().Err() != nil {
+			codebuddyKeys.noteOK(keyID) // abort is not a key fault either
+			if stickyKey != "" {
+				// keep sticky binding — client may retry the same conversation
+				_ = stickyAccountID
+			}
+			codebuddyRecordRequest(attachMeta(codebuddyRequestRecord{
+				AccountID:             upstream.ID,
+				AccountLabel:          upstream.Label,
+				Model:                 model,
+				ClientStream:          clientWantsStream,
+				Outcome:               "client_aborted",
+				ReasonCode:            "client_aborted",
+				Message:               truncateForLog(message, 200),
+				LatencyMs:             latencyMs,
+				ConversationRequestID: conversationRequestID,
+			}, upstream))
+			if c.Request.Context().Err() != nil {
+				return
+			}
+			writeAPIError(c, 499, "client aborted request (account not cooled)", "client_aborted")
+			return
+		}
 		tried++
+		rotateAttempt++
+		// Rotate backoff (workbuddy2api P0-2): small exponential pause between accounts.
+		if rotateAttempt > 1 {
+			shift := rotateAttempt - 2
+			if shift > 4 {
+				shift = 4
+			}
+			d := time.Duration(50*(1<<shift)) * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(d)/2 + 1))
+			select {
+			case <-c.Request.Context().Done():
+				return
+			case <-time.After(d/2 + jitter):
+			}
+		}
 		lastStatus, lastMessage = status, message
 		outcome, reasonCode := classifyCodebuddyOutcome(status, rawBody)
 		resetAt := parseRateResetAt(rawBody)
@@ -394,13 +722,35 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 			errDetail = truncateForLog(message, 240)
 		}
 
+		// WAF 403: account soft-cooldown + possible IP fail-fast.
+		if codebuddyLooksWafBlocked(status, rawBody) || codebuddyLooksWafBlocked(status, message) {
+			ipBlocked := pool.NoteWaf(upstream.ID)
+			codebuddyRecordRequest(attachMeta(codebuddyRequestRecord{
+				AccountID: upstream.ID, AccountLabel: upstream.Label, Model: model,
+				ClientStream: clientWantsStream, Outcome: "waf",
+				HTTPStatus: status, LatencyMs: latencyMs,
+				Message: errDetail, ReasonCode: "waf_403",
+				ConversationRequestID: conversationRequestID,
+			}, upstream))
+			if sessionKey != "" || stickyKey != "" {
+				codebuddyAffinity.Unbind(stickyKey)
+			}
+			if ipBlocked {
+				writeAPIError(c, http.StatusServiceUnavailable,
+					"upstream WAF blocked this egress IP; retry after cool-down", "waf_ip_blocked")
+				return
+			}
+			continue
+		}
+
 		// Apply governance / degraded retry based on failure shape.
 		if rawBody != "" {
 			if isModelRateLimit(rawBody) {
 				// Model-level only: other models stay selectable immediately.
+				hitRateLimit = true
 				gov.coolSoftModel(upstream.ID, model, resetAt, "6004 model rate limit")
-				if sessionKey != "" {
-					codebuddyAffinity.Unbind(sessionKey)
+				if stickyKey != "" {
+					codebuddyAffinity.Unbind(stickyKey)
 				}
 				codebuddyRecordRequest(attachMeta(codebuddyRequestRecord{
 					AccountID:             upstream.ID,
@@ -434,7 +784,9 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 					LatencyMs: latencyMs, Message: errDetail, ReasonCode: reasonCode,
 					ConversationRequestID: conversationRequestID,
 				}, upstream))
-				if promptMode == "passthrough" && !degradedApplied {
+				// 内容拦截误报（passthrough/append 首遇）：降级到中性提示词重试；
+				// append 降级时 applySystemPromptMode 会退化为 replace。
+				if (promptMode == "passthrough" || promptMode == "append") && !degradedApplied {
 					degradedApplied = true
 					s.emitExecutorDiagnostic(c, "codebuddy_content_blocked_degrade", model, upstream.ID, time.Now(), "retry with neutral system")
 					continue
@@ -443,7 +795,11 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 				return
 			}
 			if status == http.StatusTooManyRequests {
+				hitRateLimit = true
 				gov.coolSoftRate(upstream.ID, resetAt, "429 soft rate")
+				if stickyKey != "" {
+					codebuddyAffinity.Unbind(stickyKey)
+				}
 				codebuddyRecordRequest(attachMeta(codebuddyRequestRecord{
 					AccountID: upstream.ID, AccountLabel: upstream.Label, Model: model,
 					ClientStream: clientWantsStream, Outcome: outcome, HTTPStatus: status,
@@ -468,6 +824,10 @@ func (s *relayServer) handleCodebuddyChat(c *gin.Context, spec *apiKeySpec, clie
 		}
 		if status >= 500 || status == http.StatusBadGateway {
 			gov.noteFailure(upstream.ID, "upstream failure")
+			pool.NoteFailure(upstream.ID, "upstream failure")
+		}
+		if strings.Contains(rawBody, "12153") || strings.Contains(message, "12153") {
+			pool.NoteSessionDead(upstream.ID)
 		}
 		codebuddyRecordRequest(codebuddyRequestRecord{
 			AccountID: upstream.ID, AccountLabel: upstream.Label, Model: model,
@@ -496,17 +856,24 @@ func codebuddyPromptMode() string {
 	if strings.EqualFold(mode, "custom") {
 		return "custom"
 	}
+	// append：开头连续 system/developer 块后插网关 system，既有消息逐字不动
+	//（对齐 workbuddy2api prompt.mode=append，issue #129）。
+	if strings.EqualFold(mode, "append") {
+		return "append"
+	}
 	return "passthrough"
 }
 
 // codebuddyEncodeRequestBody builds the outbound body: stream:true, thinking
 // injection, reasoning backfill, system prompt policy, fingerprint sanitize.
+// degraded=true applies the content-block rescue rewrite (append degrades to replace).
 func codebuddyEncodeRequestBody(
 	payload map[string]any,
 	model string,
 	upstream *codebuddyUpstreamSpec,
 	c *gin.Context,
 	conversationRequestID string,
+	degraded bool,
 ) ([]byte, error) {
 	cloned := make(map[string]any, len(payload)+8)
 	for k, v := range payload {
@@ -531,31 +898,70 @@ func codebuddyEncodeRequestBody(
 		cloned["stream_options"] = map[string]any{"include_usage": true}
 	}
 
-	applySystemPromptMode(cloned, codebuddyPromptMode(), false)
+	applySystemPromptMode(cloned, codebuddyPromptMode(), degraded)
 	injectDeepSeekThinking(cloned, model)
 	backfillReasoningContent(cloned)
 	sanitizeRequestPayload(cloned)
 	return json.Marshal(cloned)
 }
 
-// codebuddySelectionOrder applies the manifest routing strategy and lets a
-// failed account fall through to the next one.
-func codebuddySelectionOrder(m *manifest, upstreams []*codebuddyUpstreamSpec) []*codebuddyUpstreamSpec {
+// codebuddySelectionOrder applies pool intelligence first, then falls back to
+// the legacy RR/random rotation when the pool has no differentiating state.
+func codebuddySelectionOrder(m *manifest, upstreams []*codebuddyUpstreamSpec, model string) []*codebuddyUpstreamSpec {
 	if len(upstreams) <= 1 {
 		return upstreams
 	}
-	if m != nil && strings.EqualFold(strings.TrimSpace(m.RoutingStrategy), "random") {
-		offset := int(codebuddyRotationCounter.Add(1) % uint64(len(upstreams)))
-		order := make([]*codebuddyUpstreamSpec, 0, len(upstreams))
-		order = append(order, upstreams[offset:]...)
-		order = append(order, upstreams[:offset]...)
-		return order
+	pool := codebuddyPoolInit()
+	pool.SyncFromPointers(upstreams)
+	routing := ""
+	if m != nil {
+		routing = m.RoutingStrategy
 	}
-	offset := int((codebuddyRotationCounter.Add(1) - 1) % uint64(len(upstreams)))
-	order := make([]*codebuddyUpstreamSpec, 0, len(upstreams))
-	order = append(order, upstreams[offset:]...)
-	order = append(order, upstreams[:offset]...)
-	return order
+	ordered := pool.PickOrder(upstreams, model, "", routing)
+	if len(ordered) == len(upstreams) {
+		return ordered
+	}
+	// Defensive: pool must return the same multiset.
+	return ordered
+}
+
+func codebuddySplitRealmModel(model string) (realm, bare string) {
+	model = strings.TrimSpace(model)
+	if i := strings.Index(model, ":"); i > 0 {
+		pref := strings.ToLower(model[:i])
+		if pref == "cn" || pref == "global" || pref == "intl" {
+			if pref == "intl" {
+				pref = "global"
+			}
+			return pref, model[i+1:]
+		}
+	}
+	return "", model
+}
+
+func codebuddyLooksWafBlocked(status int, body string) bool {
+	if status != http.StatusForbidden {
+		return false
+	}
+	lower := strings.ToLower(body)
+	// Business envelope → not WAF.
+	if strings.Contains(body, `"code"`) && strings.Contains(lower, `"msg"`) {
+		return false
+	}
+	if strings.TrimSpace(body) == "" {
+		return true
+	}
+	// HTML / APISIX / non-envelope payloads.
+	if strings.Contains(lower, "<html") || strings.Contains(lower, "apisix") ||
+		strings.Contains(lower, "blocked") || strings.Contains(lower, "forbidden") ||
+		strings.Contains(lower, "access denied") {
+		return true
+	}
+	// Pure text without JSON envelope.
+	if !strings.Contains(lower, "{") {
+		return true
+	}
+	return false
 }
 
 func requestedReasoning(upstream *codebuddyUpstreamSpec) bool {
@@ -718,9 +1124,15 @@ func refreshCodebuddyToken(c *gin.Context, upstream *codebuddyUpstreamSpec) (str
 	return upstream.AccessToken, nil
 }
 
+// codebuddyEventSink abstracts stdout event emission so tests can capture
+// usage events without racing process stdout.
+type codebuddyEventSink interface {
+	emit(v any)
+}
+
 // globalCodebuddyEmitter mirrors the process emitter so a refresh that happens
 // on a request path can still report back to Cockpit. main() assigns it.
-var globalCodebuddyEmitter *eventEmitter
+var globalCodebuddyEmitter codebuddyEventSink
 
 // codebuddyUpstreamError is retained for tests that still call the reader form.
 func codebuddyUpstreamError(resp *http.Response) (int, string) {
@@ -1039,6 +1451,13 @@ func truncateForLog(s string, n int) string {
 
 // codebuddyAggregateResponse folds the upstream stream into one
 // `chat.completion` object for clients that requested `stream: false`.
+//
+// Ports workbuddy2api Aggregate fixes:
+//   - empty content latch: only non-empty content sets gotAnyContent (issue #142)
+//   - non-delta message fallback shares the latch (no double-append)
+//   - tool_call missing index: id-priority / lastIdx / skip-assign (no merge pollution)
+//   - usage missing total_tokens: synthesize prompt+completion when both present
+//   - EOF-truncated tool_calls (no [DONE]) drop incomplete arguments
 func codebuddyAggregateResponse(body io.Reader, model string, includeReasoning bool) (gin.H, *codebuddyUsageSnapshot) {
 	var (
 		id           string
@@ -1050,7 +1469,94 @@ func codebuddyAggregateResponse(body io.Reader, model string, includeReasoning b
 		usageSnap    *codebuddyUsageSnapshot
 		toolCalls    []map[string]any
 		toolIndexes  = make(map[int]int)
+		gotAnyContent bool
+		sawDone       bool
+		toolSeq       int
+		idIndex       = make(map[string]int)
 	)
+
+	appendContent := func(txt string) {
+		if txt == "" {
+			return
+		}
+		content.WriteString(txt)
+		gotAnyContent = true
+	}
+
+	nextToolIndex := func() int {
+		for {
+			idx := toolSeq
+			toolSeq++
+			if _, used := toolIndexes[idx]; !used {
+				return idx
+			}
+		}
+	}
+
+	appendToolCallDeltasFixed := func(raw any) {
+		deltas, _ := raw.([]any)
+		for _, rawDelta := range deltas {
+			delta, ok := rawDelta.(map[string]any)
+			if !ok {
+				continue
+			}
+			index := -1
+			if value, ok := delta["index"].(float64); ok {
+				index = int(value)
+			} else if cid, _ := delta["id"].(string); cid != "" {
+				if mid, seen := idIndex[cid]; seen {
+					index = mid
+				} else {
+					index = nextToolIndex()
+				}
+			} else if len(toolCalls) > 0 {
+				index = len(toolCalls) - 1
+			} else {
+				index = nextToolIndex()
+			}
+			position, exists := toolIndexes[index]
+			if !exists {
+				position = len(toolCalls)
+				toolIndexes[index] = position
+				toolCalls = append(toolCalls, map[string]any{
+					"index": index,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      "",
+						"arguments": "",
+					},
+				})
+			}
+			if cid, _ := delta["id"].(string); cid != "" {
+				idIndex[cid] = index
+			}
+			entry := toolCalls[position]
+			if id := strings.TrimSpace(stringValue(delta["id"])); id != "" {
+				entry["id"] = id
+				idIndex[id] = index
+			}
+			if kind := strings.TrimSpace(stringValue(delta["type"])); kind != "" {
+				entry["type"] = kind
+			}
+			function, _ := delta["function"].(map[string]any)
+			if function == nil {
+				continue
+			}
+			existing, _ := entry["function"].(map[string]any)
+			if existing == nil {
+				existing = map[string]any{"name": "", "arguments": ""}
+				entry["function"] = existing
+			}
+			if name := stringValue(function["name"]); name != "" {
+				// Name fragments arrive split across frames for the same call index
+				// ("get_" + "weather"); concatenate. Do not replace.
+				existing["name"] = stringValue(existing["name"]) + name
+			}
+			if arguments := stringValue(function["arguments"]); arguments != "" {
+				existing["arguments"] = stringValue(existing["arguments"]) + arguments
+			}
+		}
+	}
 
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -1060,7 +1566,11 @@ func codebuddyAggregateResponse(body io.Reader, model string, includeReasoning b
 			continue
 		}
 		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		if len(payload) == 0 {
+			continue
+		}
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			sawDone = true
 			continue
 		}
 		chunk, err := decodeCodebuddyChunk(payload)
@@ -1093,15 +1603,21 @@ func codebuddyAggregateResponse(body io.Reader, model string, includeReasoning b
 			if reason := strings.TrimSpace(stringValue(choice["finish_reason"])); reason != "" {
 				finishReason = reason
 			}
-			delta, ok := choice["delta"].(map[string]any)
-			if !ok {
-				continue
+			if delta, ok := choice["delta"].(map[string]any); ok {
+				appendContent(stringValue(delta["content"]))
+				if includeReasoning {
+					reasoning.WriteString(stringValue(delta["reasoning_content"]))
+				}
+				appendToolCallDeltasFixed(delta["tool_calls"])
 			}
-			content.WriteString(stringValue(delta["content"]))
-			if includeReasoning {
-				reasoning.WriteString(stringValue(delta["reasoning_content"]))
+			// Non-delta message fallback (some upstreams): merge once behind the latch.
+			if msg, ok := choice["message"].(map[string]any); ok && !gotAnyContent {
+				appendContent(stringValue(msg["content"]))
+				if includeReasoning {
+					reasoning.WriteString(stringValue(msg["reasoning_content"]))
+				}
+				appendToolCallDeltasFixed(msg["tool_calls"])
 			}
-			appendToolCallDeltas(delta["tool_calls"], &toolCalls, toolIndexes)
 		}
 	}
 
@@ -1116,7 +1632,28 @@ func codebuddyAggregateResponse(body io.Reader, model string, includeReasoning b
 		message["reasoning_content"] = reasoning.String()
 	}
 	if len(toolCalls) > 0 {
-		message["tool_calls"] = toolCalls
+		// Drop truncated tool_call arguments when stream ended without [DONE]
+		// or finish_reason=length (workbuddy2api Aggregate P1b).
+		if finishReason == "length" || !sawDone {
+			filtered := make([]map[string]any, 0, len(toolCalls))
+			for _, call := range toolCalls {
+				fn, _ := call["function"].(map[string]any)
+				args := ""
+				if fn != nil {
+					args = stringValue(fn["arguments"])
+				}
+				if args != "" && !jsonLooksComplete(args) {
+					continue
+				}
+				filtered = append(filtered, call)
+			}
+			toolCalls = filtered
+		}
+		if len(toolCalls) > 0 {
+			message["tool_calls"] = toolCalls
+		} else if finishReason == "tool_calls" {
+			finishReason = "stop"
+		}
 	}
 
 	result := gin.H{
@@ -1132,9 +1669,48 @@ func codebuddyAggregateResponse(body io.Reader, model string, includeReasoning b
 	}
 	if usage != nil {
 		sanitizeCodebuddyUsage(usage)
-		result["usage"] = usage
+		result["usage"] = ensureCodebuddyUsageTotal(usage)
 	}
 	return result, usageSnap
+}
+
+// jsonLooksComplete is a cheap completeness check for tool-call arguments.
+func jsonLooksComplete(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return true
+	}
+	var v any
+	return json.Unmarshal([]byte(trimmed), &v) == nil
+}
+
+// ensureCodebuddyUsageTotal synthesizes total_tokens when the upstream omitted
+// it but both prompt_tokens and completion_tokens are present.
+func ensureCodebuddyUsageTotal(u map[string]any) map[string]any {
+	if _, ok := u["total_tokens"]; ok {
+		return u
+	}
+	pt, pok := u["prompt_tokens"].(float64)
+	ct, cok := u["completion_tokens"].(float64)
+	if !pok || !cok {
+		if pi, pok2 := u["prompt_tokens"].(int64); pok2 {
+			if ci, cok2 := u["completion_tokens"].(int64); cok2 {
+				out := make(map[string]any, len(u)+1)
+				for k, v := range u {
+					out[k] = v
+				}
+				out["total_tokens"] = pi + ci
+				return out
+			}
+		}
+		return u
+	}
+	out := make(map[string]any, len(u)+1)
+	for k, v := range u {
+		out[k] = v
+	}
+	out["total_tokens"] = pt + ct
+	return out
 }
 
 func appendToolCallDeltas(raw any, target *[]map[string]any, indexes map[int]int) {
