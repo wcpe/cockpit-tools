@@ -54,3 +54,6 @@ docs/plugin-architecture-proposal.md
 
 sidecars/mihomo/bin/
 /.workbuddy/
+/dist-portable/
+/.workbuddy/
+*.exe
