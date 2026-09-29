@@ -4,6 +4,7 @@ import {
   ArrowDown,
   ArrowUp,
   Clock3,
+  FileText,
   FolderOpen,
   Layers,
   MoreHorizontal,
@@ -46,6 +47,8 @@ function tabMeta(tab: CodexTab) {
       return { labelKey: 'codex.more.topLayoutTitle', fallback: '顶部布局', icon: <PanelTop className="tab-icon" /> };
     case 'sessions':
       return { labelKey: 'codex.sessionManager.title', fallback: '会话管理', icon: <FolderOpen className="tab-icon" /> };
+    case 'activityLogs':
+      return { labelKey: 'workbuddy.activity.logs', fallback: '活动日志', icon: <FileText className="tab-icon" /> };
   }
 }
 
