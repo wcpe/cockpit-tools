@@ -642,20 +642,88 @@ impl ActivityClient {
             .collect())
     }
 
-    pub async fn accept_tasks(
+    /// 带 mp 头的 accept（growth 域小程序限定任务）。
+    async fn accept_tasks_mp(
         &self,
         account: &WorkbuddyAccount,
         codes: &[String],
+    ) -> Result<(u16, Value), String> {
+        if codes.is_empty() {
+            return Ok((200, json!({"code": 0})));
+        }
+        let realm = resolve_realm(account.domain.as_deref());
+        let url = format!("{}/v2/activity/growth/tasks/accept", realm.chat_base());
+        self.post_mp(account, &url, Some(json!({ "task_codes": codes })))
+            .await
+    }
+
+    /// 读 accept 响应里 results[].status（对齐 workbuddy2api _accept_with_verify）。
+    /// 上游存在 HTTP 200 + code=0 但 status 非 accepted / 服务端未落账的形态。
+    fn accept_result_status(payload: &Value) -> String {
+        if let Some(results) = payload
+            .get("data")
+            .and_then(|d| d.get("results"))
+            .and_then(Value::as_array)
+        {
+            if let Some(first) = results.first() {
+                if let Some(status) = first.get("status").and_then(Value::as_str) {
+                    return status.to_string();
+                }
+            }
+        }
+        payload
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// accept 并验证登记生效：读 results[].status + 回读 accept_status，
+    /// 失败重试一次。对齐 workbuddy2api scripts/task_runner.py `_accept_with_verify`。
+    /// 返回 true = 登记已生效（本轮或此前）。
+    pub async fn accept_tasks_verified(
+        &self,
+        account: &WorkbuddyAccount,
+        codes: &[String],
+        logs: &mut Vec<String>,
     ) -> Result<bool, String> {
         if codes.is_empty() {
             return Ok(true);
         }
         let realm = resolve_realm(account.domain.as_deref());
-        let url = format!("{}/v2/activity/growth/tasks/accept", realm.chat_base());
-        let (_, payload) = self
-            .post(account, &url, Some(json!({ "task_codes": codes })))
-            .await?;
-        Ok(payload.get("code").and_then(Value::as_i64).unwrap_or(-1) == 0)
+        let accept_url = format!("{}/v2/activity/growth/tasks/accept", realm.chat_base());
+        for attempt in 1..=2u8 {
+            let (_, payload) = self
+                .post(account, &accept_url, Some(json!({ "task_codes": codes })))
+                .await?;
+            let status = Self::accept_result_status(&payload);
+            let tasks = self.fetch_tasks(account).await.unwrap_or_default();
+            let registered = codes
+                .iter()
+                .filter(|code| {
+                    tasks
+                        .iter()
+                        .find(|t| t.task_code == **code)
+                        .map(|t| t.status.as_str() != "not_accepted")
+                        .unwrap_or(false)
+                })
+                .count();
+            // 以回读 accept_status 为准：响应可能说 accepted 但服务端未落账。
+            let ok = registered == codes.len();
+            logs.push(format!(
+                "accept 尝试{} status={} 回读登记 {}/{}{}",
+                attempt,
+                status,
+                registered,
+                codes.len(),
+                if ok { " -> 生效" } else { "" }
+            ));
+            if ok {
+                return Ok(true);
+            }
+            tokio::time::sleep(MIN_REQUEST_GAP).await;
+        }
+        Ok(false)
     }
 
     /// 领奖。desktop 域 400 时降级到网页域（对齐上游实现）。
@@ -1189,6 +1257,23 @@ impl ActivityClient {
         })
     }
 
+    /// growth 域 school_season（校园日）判据：mini 指纹 chat_request_send +
+    /// activityId=school_open_day_2026（对齐 workbuddy2api school.mini_chat_event；
+    /// 无 activityId 的事件不点亮）。extVersion=SaaS 与 school 模块一致。
+    pub fn build_school_season_growth_event(uid: &str, idx: usize) -> Value {
+        let now = chrono::Utc::now().timestamp_millis();
+        let cid = format!("wbmp-{}-{}", now, idx);
+        json!({
+            "eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
+            "source": "mini_program", "ideName": "wx_app_cloud",
+            "ideType": "WorkBuddy_MP", "extName": "workbuddy-mp",
+            "extVersion": "SaaS", "mode": "chat",
+            "conversationId": cid, "requestId": cid, "inputLength": 12,
+            "activityId": "school_open_day_2026",
+            "mentionContexts": [], "mentionContextCount": 0, "userId": uid
+        })
+    }
+
     /// 开学季事件（school 域）。
     pub fn build_school_event(uid: &str, kind: &str, activity_id: &str, idx: usize) -> Value {
         let now = chrono::Utc::now().timestamp_millis();
@@ -1256,8 +1341,12 @@ impl ActivityClient {
         Ok((status, payload))
     }
 
-    /// Sequential_Tasks_1：mp 口径查询 → accept → mini 对话点亮 → claim。
+    /// growth 域小程序限定任务（对齐 workbuddy2api task_runner mp 专段）：
+    /// Sequential_Tasks_1（mini 对话，无 activityId）与 school_season（校园日，
+    /// mini 对话 + activityId=school_open_day_2026）。链路：mp 口径查询 →
+    /// accept（验证登记）→ mini 判据上报 → claim。
     pub async fn run_miniprogram_growth(&self, account: &WorkbuddyAccount) -> ActivityRunLog {
+        const MP_CODES: &[&str] = &["Sequential_Tasks_1", "school_season"];
         let label = account_label(account);
         let mut logs = Vec::new();
         let mut earned = 0i64;
@@ -1288,74 +1377,106 @@ impl ActivityClient {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let Some(task) = tasks
-            .iter()
-            .find(|t| t.get("task_code").and_then(Value::as_str) == Some("Sequential_Tasks_1"))
-            .cloned()
-        else {
-            logs.push("小程序任务 Sequential_Tasks_1 不在清单（可能未开放或已下线）".to_string());
-            return ActivityRunLog {
-                ok: true,
-                account_id: account.id.clone(),
-                label,
-                earned_credit: 0,
-                logs,
+        let mut ran_any = false;
+        for code in MP_CODES {
+            let Some(task) = tasks
+                .iter()
+                .find(|t| t.get("task_code").and_then(Value::as_str) == Some(*code))
+                .cloned()
+            else {
+                logs.push(format!(
+                    "小程序任务 {} 不在清单（可能未开放或已下线）",
+                    code
+                ));
+                continue;
             };
-        };
-        let status = task
-            .get("accept_status")
-            .and_then(Value::as_str)
-            .unwrap_or("not_accepted")
-            .to_string();
-        if status == "claimed" {
-            logs.push("Sequential_Tasks_1 今日已领取".to_string());
-            return ActivityRunLog {
-                ok: true,
-                account_id: account.id.clone(),
-                label,
-                earned_credit: 0,
-                logs,
+            ran_any = true;
+            let status = task
+                .get("accept_status")
+                .and_then(Value::as_str)
+                .unwrap_or("not_accepted")
+                .to_string();
+            if status == "claimed" {
+                logs.push(format!("{} 今日已领取", code));
+                continue;
+            }
+            if status == "not_accepted" {
+                match self
+                    .accept_tasks_mp(account, &[(*code).to_string()])
+                    .await
+                {
+                    Ok((_, resp)) => {
+                        let st = Self::accept_result_status(&resp);
+                        let code_ok =
+                            resp.get("code").and_then(Value::as_i64).unwrap_or(-1) == 0;
+                        logs.push(format!("{} accept status={} ok={}", code, st, code_ok));
+                        if !code_ok || (st != "accepted" && !st.is_empty() && st != "OK") {
+                            // 回读确认登记；未生效则本轮跳过，避免上报不归账
+                            tokio::time::sleep(MIN_REQUEST_GAP).await;
+                            if let Ok(check) = self.get_mp(account, &tasks_url).await {
+                                let still = check
+                                    .get("data")
+                                    .and_then(|d| d.get("tasks"))
+                                    .and_then(Value::as_array)
+                                    .and_then(|list| {
+                                        list.iter().find(|t| {
+                                            t.get("task_code").and_then(Value::as_str) == Some(*code)
+                                        })
+                                    })
+                                    .and_then(|t| t.get("accept_status").and_then(Value::as_str))
+                                    .unwrap_or("not_accepted");
+                                if still == "not_accepted" {
+                                    logs.push(format!("{} accept 未登记生效，本轮跳过", code));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        logs.push(format!("{} accept 失败: {}", code, error));
+                        continue;
+                    }
+                }
+                tokio::time::sleep(MIN_REQUEST_GAP).await;
+            }
+            // 判据点亮：Sequential_Tasks_1 无 activityId；school_season 带 activityId
+            let event = if *code == "school_season" {
+                Self::build_school_season_growth_event(&uid, 0)
+            } else {
+                Self::build_miniprogram_chat_event(&uid, 0)
             };
-        }
-        if status == "not_accepted" {
-            let accept_url = format!("{}/v2/activity/growth/tasks/accept", realm.chat_base());
+            let report_url = format!("{}/v2/report", realm.bill_base());
             let _ = self
-                .post_mp(
-                    account,
-                    &accept_url,
-                    Some(json!({ "task_codes": ["Sequential_Tasks_1"] })),
-                )
+                .post_mp(account, &report_url, Some(json!([event])))
                 .await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            // claim（mp 头）
+            let claim_url = format!(
+                "{}/activity/growth/tasks/{}/claim",
+                realm.chat_base(),
+                code
+            );
+            match self.post_mp(account, &claim_url, None).await {
+                Ok((_, payload)) if payload.get("code").and_then(Value::as_i64) == Some(0) => {
+                    let data = payload.get("data").cloned().unwrap_or(Value::Null);
+                    let credit = data.get("credit").and_then(Value::as_i64).unwrap_or(0);
+                    earned += credit;
+                    logs.push(format!("✓ {} 领奖 +{} 积分", code, credit));
+                }
+                Ok((_, payload)) => {
+                    let msg = payload.get("msg").and_then(Value::as_str).unwrap_or("");
+                    if msg.contains("already") || msg.contains("已领取") {
+                        logs.push(format!("{} 已领取", code));
+                    } else {
+                        logs.push(format!("{} 领奖: {}", code, msg));
+                    }
+                }
+                Err(error) => logs.push(format!("{} 领奖失败: {}", code, error)),
+            }
             tokio::time::sleep(MIN_REQUEST_GAP).await;
         }
-        // 点亮
-        let event = Self::build_miniprogram_chat_event(&uid, 0);
-        let report_url = format!("{}/v2/report", realm.bill_base());
-        let _ = self
-            .post_mp(account, &report_url, Some(json!([event])))
-            .await;
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        // claim（mp 头）
-        let claim_url = format!(
-            "{}/activity/growth/tasks/Sequential_Tasks_1/claim",
-            realm.chat_base()
-        );
-        match self.post_mp(account, &claim_url, None).await {
-            Ok((_, payload)) if payload.get("code").and_then(Value::as_i64) == Some(0) => {
-                let data = payload.get("data").cloned().unwrap_or(Value::Null);
-                let credit = data.get("credit").and_then(Value::as_i64).unwrap_or(0);
-                earned += credit;
-                logs.push(format!("✓ Sequential_Tasks_1 领奖 +{} 积分", credit));
-            }
-            Ok((_, payload)) => {
-                let msg = payload.get("msg").and_then(Value::as_str).unwrap_or("");
-                if msg.contains("already") || msg.contains("已领取") {
-                    logs.push("Sequential_Tasks_1 已领取".to_string());
-                } else {
-                    logs.push(format!("Sequential_Tasks_1 领奖: {}", msg));
-                }
-            }
-            Err(error) => logs.push(format!("Sequential_Tasks_1 领奖失败: {}", error)),
+        if !ran_any {
+            logs.push("mp 口径无可用小程序任务".to_string());
         }
         ActivityRunLog {
             ok: true,
@@ -1682,7 +1803,17 @@ impl ActivityClient {
                 "发现 {} 个待接取任务，正在批量接取...",
                 unaccepted.len()
             ));
-            let _ = self.accept_tasks(account, &unaccepted).await;
+            // 对齐 workbuddy2api：accept 后验证登记生效，失败重试一次；
+            // 未登记的任务本轮跳过，避免上报事件不归账。
+            if let Ok(false) = self
+                .accept_tasks_verified(account, &unaccepted, &mut logs)
+                .await
+            {
+                logs.push(format!(
+                    "accept 未全部登记生效（{} 个），未生效任务本轮跳过",
+                    unaccepted.len()
+                ));
+            }
             tokio::time::sleep(MIN_REQUEST_GAP).await;
             if let Ok(refreshed) = self.fetch_tasks(account).await {
                 tasks = refreshed;
@@ -1939,8 +2070,25 @@ impl ActivityClient {
             };
         }
         if task.status == "not_accepted" {
-            let _ = self.accept_tasks(account, &[task_code.to_string()]).await;
-            tokio::time::sleep(MIN_REQUEST_GAP).await;
+            match self
+                .accept_tasks_verified(account, &[task_code.to_string()], &mut logs)
+                .await
+            {
+                Ok(true) => tokio::time::sleep(MIN_REQUEST_GAP).await,
+                _ => {
+                    logs.push(format!(
+                        "任务 [{}] accept 未登记生效，本轮跳过",
+                        spec.name
+                    ));
+                    return ActivityRunLog {
+                        ok: false,
+                        account_id: account.id.clone(),
+                        label,
+                        earned_credit: 0,
+                        logs,
+                    };
+                }
+            }
         }
         if task.status != "completed" && task.current < task.target {
             let need = (task.target - task.current).max(1);
