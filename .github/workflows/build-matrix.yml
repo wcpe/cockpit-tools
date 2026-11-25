@@ -323,24 +323,3 @@ jobs:
             echo
             echo "---"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 📤 Upload build logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-${{ matrix.label }}
-          retention-days: 7
-          if-no-files-found: warn
-          path: |
-            build-${{ matrix.label }}.log
-            warnings-${{ matrix.label }}.txt
-
-      - name: 📤 Upload build bundles
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bundles-${{ matrix.label }}
-          retention-days: 7
-          if-no-files-found: error
-          path: |
-            ${{ matrix.release_dir }}/bundle

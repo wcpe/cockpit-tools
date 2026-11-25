@@ -137,11 +137,9 @@ jobs:
           fi
 
       - name: 📤 Upload release metadata artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: release-metadata
-          retention-days: 7
-          if-no-files-found: error
+          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             release-notes.md
             published-at.txt
@@ -204,10 +202,11 @@ jobs:
           npx tauri build --ci
 
       - name: 📥 Download release metadata
-        uses: actions/download-artifact@v4
+        uses: actions/cache/restore@v4
         with:
-          name: release-metadata
+          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-metadata
+          fail-on-cache-miss: true
 
       - name: 📦 Stage Windows release assets
         shell: bash
@@ -316,10 +315,11 @@ jobs:
             --bundle-dir "target/aarch64-apple-darwin/release/bundle"
 
       - name: 📥 Download release metadata
-        uses: actions/download-artifact@v4
+        uses: actions/cache/restore@v4
         with:
-          name: release-metadata
+          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-metadata
+          fail-on-cache-miss: true
 
       - name: 📦 Stage macOS Apple Silicon assets
         shell: bash
@@ -429,10 +429,11 @@ jobs:
             --bundle-dir "target/x86_64-apple-darwin/release/bundle"
 
       - name: 📥 Download release metadata
-        uses: actions/download-artifact@v4
+        uses: actions/cache/restore@v4
         with:
-          name: release-metadata
+          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-metadata
+          fail-on-cache-miss: true
 
       - name: 📦 Stage macOS Intel assets
         shell: bash
@@ -641,10 +642,11 @@ jobs:
           npx tauri build --ci
 
       - name: 📥 Download release metadata
-        uses: actions/download-artifact@v4
+        uses: actions/cache/restore@v4
         with:
-          name: release-metadata
+          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-metadata
+          fail-on-cache-miss: true
 
       - name: 📦 Stage Linux assets
         shell: bash
@@ -710,10 +712,11 @@ jobs:
           node-version: 20
 
       - name: 📥 Download release metadata
-        uses: actions/download-artifact@v4
+        uses: actions/cache/restore@v4
         with:
-          name: release-metadata
+          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-metadata
+          fail-on-cache-miss: true
 
       - name: 📥 Download all release assets
         env:
