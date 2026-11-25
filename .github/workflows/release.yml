@@ -18,6 +18,10 @@ jobs:
       contents: write
     outputs:
       version: ${{ steps.app_version.outputs.VERSION }}
+      # 元数据是小文本，走 job outputs（同 run 跨 job cache 传文件
+      # 实测不可靠，outputs 是官方可靠通道）。notes 用 base64 免多行转义。
+      release-notes-b64: ${{ steps.meta_out.outputs.release_notes_b64 }}
+      published-at: ${{ steps.meta_out.outputs.published_at }}
     env:
       GH_REPO: ${{ github.repository }}
     steps:
@@ -136,13 +140,13 @@ jobs:
             gh release create "${TAG}" --draft --title "${TITLE}" --notes-file release-notes.md
           fi
 
-      - name: 📤 Upload release metadata artifact
-        uses: actions/cache/save@v4
-        with:
-          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            release-notes.md
-            published-at.txt
+      - name: 📤 Export release metadata as outputs
+        id: meta_out
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "release_notes_b64=$(base64 -w0 release-notes.md)" >> "$GITHUB_OUTPUT"
+          echo "published_at=$(cat published-at.txt)" >> "$GITHUB_OUTPUT"
 
   build-windows:
     name: "🏗️ Build: Windows"
@@ -202,11 +206,12 @@ jobs:
           npx tauri build --ci
 
       - name: 📥 Download release metadata
-        uses: actions/cache/restore@v4
-        with:
-          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release-metadata
-          fail-on-cache-miss: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-metadata
+          echo "${{ needs.prepare-release.outputs.release-notes-b64 }}" | base64 -d > release-metadata/release-notes.md
+          echo "${{ needs.prepare-release.outputs.published-at }}" > release-metadata/published-at.txt
 
       - name: 📦 Stage Windows release assets
         shell: bash
@@ -315,11 +320,12 @@ jobs:
             --bundle-dir "target/aarch64-apple-darwin/release/bundle"
 
       - name: 📥 Download release metadata
-        uses: actions/cache/restore@v4
-        with:
-          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release-metadata
-          fail-on-cache-miss: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-metadata
+          echo "${{ needs.prepare-release.outputs.release-notes-b64 }}" | base64 -d > release-metadata/release-notes.md
+          echo "${{ needs.prepare-release.outputs.published-at }}" > release-metadata/published-at.txt
 
       - name: 📦 Stage macOS Apple Silicon assets
         shell: bash
@@ -429,11 +435,12 @@ jobs:
             --bundle-dir "target/x86_64-apple-darwin/release/bundle"
 
       - name: 📥 Download release metadata
-        uses: actions/cache/restore@v4
-        with:
-          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release-metadata
-          fail-on-cache-miss: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-metadata
+          echo "${{ needs.prepare-release.outputs.release-notes-b64 }}" | base64 -d > release-metadata/release-notes.md
+          echo "${{ needs.prepare-release.outputs.published-at }}" > release-metadata/published-at.txt
 
       - name: 📦 Stage macOS Intel assets
         shell: bash
@@ -642,11 +649,12 @@ jobs:
           npx tauri build --ci
 
       - name: 📥 Download release metadata
-        uses: actions/cache/restore@v4
-        with:
-          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release-metadata
-          fail-on-cache-miss: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-metadata
+          echo "${{ needs.prepare-release.outputs.release-notes-b64 }}" | base64 -d > release-metadata/release-notes.md
+          echo "${{ needs.prepare-release.outputs.published-at }}" > release-metadata/published-at.txt
 
       - name: 📦 Stage Linux assets
         shell: bash
@@ -712,11 +720,12 @@ jobs:
           node-version: 20
 
       - name: 📥 Download release metadata
-        uses: actions/cache/restore@v4
-        with:
-          key: release-metadata-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release-metadata
-          fail-on-cache-miss: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-metadata
+          echo "${{ needs.prepare-release.outputs.release-notes-b64 }}" | base64 -d > release-metadata/release-notes.md
+          echo "${{ needs.prepare-release.outputs.published-at }}" > release-metadata/published-at.txt
 
       - name: 📥 Download all release assets
         env:
